@@ -9,6 +9,7 @@ pub mod camera;
 pub mod common;
 pub mod interaction;
 pub mod mesh;
+pub mod motion_lines;
 pub mod scene;
 pub mod viewer;
 

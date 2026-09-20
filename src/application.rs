@@ -4,9 +4,11 @@
 //! created a device. It therefore cannot safely receive `&mut Viewer`.
 //! [`TaskQueue`] records work now and runs it only after the viewer is ready.
 
+#[cfg(target_arch = "wasm32")]
+use crate::camera::CameraFollowConfig;
 use crate::{
-  camera::CameraConfig, common::*, interaction::Interaction, mesh::Mesh, scene::AnimatedScene,
-  viewer::Viewer,
+  camera::CameraConfig, common::*, interaction::Interaction, mesh::Mesh,
+  motion_lines::MotionLineConfig, scene::AnimatedScene, viewer::Viewer,
 };
 use futures::{
   Future, FutureExt, executor::LocalPool, future::LocalBoxFuture, task::LocalSpawnExt,
@@ -29,6 +31,12 @@ use winit::{
 
 /// A mutation guaranteed to run with an initialized graphics context.
 pub type ViewerAction = Box<dyn FnOnce(&mut Viewer) + 'static>;
+
+#[cfg(target_arch = "wasm32")]
+enum WebCameraPose {
+  Fixed(CameraConfig),
+  FollowMesh(CameraFollowConfig),
+}
 
 /// A deferred action or asynchronous routine. Async routines receive a client,
 /// never a viewer reference, so they cannot keep GPU state borrowed over await.
@@ -53,7 +61,7 @@ struct TaskQueueState {
   // animation is a state stream, not a FIFO command stream: an intermediate
   // pose has no value after JavaScript has submitted a newer one.
   #[cfg(target_arch = "wasm32")]
-  latest_web_camera: HashMap<u64, CameraConfig>,
+  latest_web_camera: HashMap<u64, WebCameraPose>,
 }
 
 /// A clonable producer for viewer work.
@@ -195,8 +203,34 @@ impl TaskQueue {
     self.enqueue(move |viewer| viewer.set_animation_speed(speed));
   }
 
+  /// Configures the seed-selection and uniform sampling stage on native.
+  /// Browser callers use the result-bearing variant below so JavaScript can
+  /// report invalid settings or GPU-size limits to the slide component.
+  pub fn configure_motion_lines(&self, config: MotionLineConfig) {
+    self.enqueue(move |viewer| {
+      if let Err(error) = viewer.configure_motion_lines(config) {
+        eprintln!("could not configure motion lines: {error:#}");
+      }
+    });
+  }
+
+  pub fn clear_motion_lines(&self) { self.enqueue(|viewer| viewer.clear_motion_lines()); }
+
+  /// Queues a native diagnostic of CPU RSS and viewer-owned GPU allocations.
+  /// The action is deferred because Lua scripts run before the wgpu viewer is
+  /// initialized.
+  #[cfg(not(target_arch = "wasm32"))]
+  pub fn print_memory_usage(&self, label: String) {
+    self.enqueue(move |viewer| viewer.print_memory_usage(&label));
+  }
+
   pub fn set_camera(&self, camera: CameraConfig) {
     self.enqueue(move |viewer| viewer.set_camera(camera));
+  }
+
+  /// Queues a normalized linear-RGB background color for the native viewer.
+  pub fn set_background_color(&self, color: [f32; 3]) {
+    self.enqueue(move |viewer| viewer.set_background_color(color));
   }
 
   pub fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
@@ -258,13 +292,35 @@ impl TaskQueue {
   /// this value immediately before encoding its GPU commands.
   #[cfg(target_arch = "wasm32")]
   pub fn set_web_camera(&self, id: u64, camera: CameraConfig) {
-    self.state.borrow_mut().latest_web_camera.insert(id, camera);
+    self
+      .state
+      .borrow_mut()
+      .latest_web_camera
+      .insert(id, WebCameraPose::Fixed(camera));
+  }
+
+  /// Replaces the pending web camera offset with a pose that follows the
+  /// currently animated mesh. The viewer resolves the target and clipping
+  /// planes after the current animation pose has been uploaded.
+  #[cfg(target_arch = "wasm32")]
+  pub fn set_web_camera_follow_mesh(&self, id: u64, camera: CameraFollowConfig) {
+    self
+      .state
+      .borrow_mut()
+      .latest_web_camera
+      .insert(id, WebCameraPose::FollowMesh(camera));
+  }
+
+  /// Browser-scoped equivalent of [`Self::set_background_color`].
+  #[cfg(target_arch = "wasm32")]
+  pub fn set_web_background_color(&self, id: u64, color: [f32; 3]) {
+    self.enqueue_web(id, move |viewer| viewer.set_background_color(color));
   }
 
   /// Takes the most recent pose for the active component immediately before
   /// a frame is rendered. This keeps camera animation off the task queue.
   #[cfg(target_arch = "wasm32")]
-  fn take_web_camera(&self, active_id: u64) -> Option<CameraConfig> {
+  fn take_web_camera(&self, active_id: u64) -> Option<WebCameraPose> {
     self.state.borrow_mut().latest_web_camera.remove(&active_id)
   }
 
@@ -380,6 +436,23 @@ impl TaskQueue {
   #[cfg(target_arch = "wasm32")]
   pub fn set_web_animation_speed(&self, id: u64, speed: f32) {
     self.enqueue_web(id, move |viewer| viewer.set_animation_speed(speed));
+  }
+
+  /// Browser-scoped motion-line configuration with an acknowledgement for
+  /// JavaScript callers. The acknowledgement means the CPU preparation and
+  /// compute dispatch have been queued on the active viewer.
+  #[cfg(target_arch = "wasm32")]
+  pub fn configure_web_motion_lines(
+    &self,
+    id: u64,
+    config: MotionLineConfig,
+  ) -> oneshot::Receiver<Result<()>> {
+    self.enqueue_web_with_result(id, move |viewer| viewer.configure_motion_lines(config))
+  }
+
+  #[cfg(target_arch = "wasm32")]
+  pub fn clear_web_motion_lines(&self, id: u64) {
+    self.enqueue_web(id, |viewer| viewer.clear_motion_lines());
   }
 }
 
@@ -1176,7 +1249,10 @@ impl App {
     };
     if let Some(mut viewer_value) = viewer.take() {
       if let Some(camera) = camera {
-        viewer_value.set_camera(camera);
+        match camera {
+          WebCameraPose::Fixed(camera) => viewer_value.set_camera(camera),
+          WebCameraPose::FollowMesh(camera) => viewer_value.set_camera_follow_mesh(camera),
+        }
       }
       viewer_value.update_animation(delta);
       viewer_value.render();
@@ -1316,7 +1392,10 @@ impl ApplicationHandler<ApplicationEvent> for App {
             // allocation for every animation frame.
             #[cfg(target_arch = "wasm32")]
             if let Some(camera) = camera {
-              viewer.set_camera(camera);
+              match camera {
+                WebCameraPose::Fixed(camera) => viewer.set_camera(camera),
+                WebCameraPose::FollowMesh(camera) => viewer.set_camera_follow_mesh(camera),
+              }
             }
             // The animation update happens immediately before the
             // draw, so a selected glTF clip remains independent from

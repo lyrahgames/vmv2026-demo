@@ -28,7 +28,7 @@ struct SkinTransform { matrix: mat4x4<f32>, normal: mat4x4<f32> };
 @group(1) @binding(2) var<storage, read> morph_weights: array<f32>;
 
 // The vertex stage forwards world-space values to the fragment stage for the
-// simple per-fragment headlight calculation below.
+// view-dependent toon and silhouette calculation below.
 struct Out { @builtin(position) position: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32> };
 
 // Transform each mesh vertex into clip space.  Positions are already in world
@@ -66,8 +66,32 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) world: vec3<f3
   return o;
 }
 
-// Use the camera as a light source.  The ambient term keeps back-facing or
-// nearly unlit triangles visible against the dark render clear color.
+// This is the stepped view-lighting curve used by the teaser surface shader.
+// The view direction is used instead of a fixed world-space light so the
+// result remains stable when the camera is orbited around the model.
+fn toon_light(view_alignment: f32) -> f32 {
+  let light = pow(clamp(view_alignment, 0.0, 1.0), 0.5);
+  if (light <= 0.55) {
+    return 0.4;
+  }
+  if (light <= 0.8) {
+    return 0.8;
+  }
+  return 1.0;
+}
+
+// A smooth normal-based contour darkens the grazing-angle band of the
+// surface. This is the silhouette analogue of the teaser's optional
+// edge-distance wireframe: it needs no extra barycentric vertex data and
+// works for both static and GPU-skinned meshes. `fwidth` keeps the narrow band
+// from flickering when its projected width is close to one pixel.
+fn silhouette_mask(view_alignment: f32) -> f32 {
+  let anti_alias = max(fwidth(view_alignment) * 1.5, 0.005);
+  // Extend the transition farther toward front-facing normals so the contour
+  // reads as a broad graphic stroke rather than a narrow one-pixel rim.
+  return 1.0 - smoothstep(0.035 - anti_alias, 0.28 + anti_alias, view_alignment);
+}
+
 fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
   let low = color * 12.92;
   let high = 1.055 * pow(color, vec3(1.0 / 2.4)) - vec3(0.055);
@@ -75,9 +99,23 @@ fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment fn fs_main(v:Out) -> @location(0) vec4<f32> {
-  let light=normalize(uniforms.camera.xyz-v.world);
-  let diffuse=max(dot(normalize(v.normal),light),0.0);
-  let linear=vec3(0.72,0.75,0.80)*(0.2+0.8*diffuse);
-  let color=mix(linear,linear_to_srgb(linear),uniforms.encode_srgb.x);
+  let normal = normalize(v.normal);
+  let view_direction = normalize(uniforms.camera.xyz - v.world);
+  // The teaser uses abs(view-space-normal.z), which is equivalent to the
+  // absolute view-normal alignment here and keeps the reverse side readable.
+  let view_alignment = abs(dot(normal, view_direction));
+  let light = toon_light(view_alignment);
+  // The teaser's surface shader uses a neutral grayscale material. Keeping
+  // the brightest toon band at one makes front-facing regions pure white
+  // instead of tinting them blue-gray.
+  let surface_linear = vec3(light);
+
+  // Silhouette pixels are deliberately dark rather than transparent. This
+  // keeps the contour visible on the white scripted background while still
+  // allowing the mesh depth pass to occlude motion lines correctly.
+  let contour = silhouette_mask(view_alignment);
+  let contour_linear = vec3(0.08, 0.09, 0.11);
+  let linear = mix(surface_linear, contour_linear, contour);
+  let color = mix(linear, linear_to_srgb(linear), uniforms.encode_srgb.x);
   return vec4(color,1.0);
 }

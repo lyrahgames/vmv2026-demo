@@ -2042,7 +2042,16 @@ fn wrap_time(time: f32, duration: f32) -> f32 {
   if duration <= 0.0 {
     0.0
   } else {
-    time.rem_euclid(duration)
+    let wrapped = time.rem_euclid(duration);
+    // Preserve a positive exact clip endpoint. This matters to trajectory
+    // extraction: the final uniform sample should be the authored last pose,
+    // not an immediate jump back to the first pose. A time of zero remains
+    // the first pose as usual.
+    if time > 0.0 && wrapped == 0.0 {
+      duration
+    } else {
+      wrapped
+    }
   }
 }
 

@@ -6,9 +6,10 @@
 
 use crate::{
   application::{App, ApplicationEvent, TaskQueue},
-  camera::CameraConfig,
+  camera::{CameraConfig, CameraFollowConfig},
   common::*,
   mesh::Mesh,
+  motion_lines::{MotionLineConfig, SeedSelectionAlgorithm},
   scene::{AnimatedScene, AnimationInfo},
 };
 use js_sys::Uint8Array;
@@ -172,6 +173,30 @@ impl ViewerHandle {
     }
   }
 
+  /// Sets the normalized linear-RGB clear color used by the active canvas.
+  /// JavaScript passes `[red, green, blue]`; the Rust viewer clamps values so
+  /// scripts can safely use ordinary normalized color constants.
+  #[wasm_bindgen(js_name = setBackgroundColor)]
+  pub fn set_background_color(&self, color: js_sys::Array) -> Result<(), JsValue> {
+    let mut rgb = [0.0_f32; 3];
+    for (index, channel) in rgb.iter_mut().enumerate() {
+      let value = color
+        .get(index as u32)
+        .as_f64()
+        .ok_or_else(|| JsValue::from_str("background color must be [red, green, blue]"))?;
+      if !value.is_finite() {
+        return Err(JsValue::from_str(
+          "background color channels must be finite",
+        ));
+      }
+      *channel = value as f32;
+    }
+    if let Some(queue) = self.queue() {
+      queue.set_web_background_color(self.id, rgb);
+    }
+    Ok(())
+  }
+
   pub fn resize(&self, width: u32, height: u32) {
     if let Some(queue) = self.queue() {
       let size = winit::dpi::PhysicalSize::new(width.max(1), height.max(1));
@@ -219,6 +244,46 @@ impl ViewerHandle {
     }
   }
 
+  /// Extracts and renders a trajectory for every source surface vertex.
+  #[wasm_bindgen(js_name = setMotionLinesAll)]
+  pub async fn set_motion_lines_all(&self, fps: f32) -> Result<(), JsValue> {
+    self
+      .set_motion_lines(MotionLineConfig {
+        seed_selection:    SeedSelectionAlgorithm::AllVertices,
+        frames_per_second: fps,
+      })
+      .await
+  }
+
+  /// Extracts and renders trajectories for `count` distinct source vertices.
+  #[wasm_bindgen(js_name = setMotionLinesRandom)]
+  pub async fn set_motion_lines_random(&self, count: usize, fps: f32) -> Result<(), JsValue> {
+    self
+      .set_motion_lines(MotionLineConfig {
+        seed_selection:    SeedSelectionAlgorithm::RandomVertices { count },
+        frames_per_second: fps,
+      })
+      .await
+  }
+
+  async fn set_motion_lines(&self, config: MotionLineConfig) -> Result<(), JsValue> {
+    let Some(queue) = self.queue() else {
+      return Err(JsValue::from_str("viewer runtime has stopped"));
+    };
+    let result = queue
+      .configure_web_motion_lines(self.id, config)
+      .await
+      .map_err(|_| JsValue::from_str("motion-line configuration was cancelled"))?;
+    result.map_err(|error| JsValue::from_str(&error.to_string()))
+  }
+
+  #[wasm_bindgen(js_name = clearMotionLines)]
+  pub fn clear_motion_lines(&self) {
+    if let Some(queue) = self.queue() {
+      queue.clear_web_motion_lines(self.id);
+    }
+  }
+
   pub fn set_camera(
     &self,
     eye: js_sys::Array,
@@ -244,6 +309,37 @@ impl ViewerHandle {
       // only its newest pose until winit is ready to render, rather than
       // queueing a backlog that would make the animation lag behind.
       queue.set_web_camera(self.id, camera);
+    }
+    Ok(())
+  }
+
+  /// Sets a camera offset relative to the current animated mesh center. The
+  /// renderer resolves the center after advancing the pose, so scripted
+  /// camera paths follow root motion without requiring JavaScript to guess the
+  /// mesh position or clipping range.
+  #[wasm_bindgen(js_name = setCameraFollowMesh)]
+  pub fn set_camera_follow_mesh(
+    &self,
+    offset: js_sys::Array,
+    up: js_sys::Array,
+    fov: f32,
+  ) -> Result<(), JsValue> {
+    fn vec3(a: &js_sys::Array) -> Vec3 {
+      Vec3::new(
+        a.get(0).as_f64().unwrap_or(0.) as f32,
+        a.get(1).as_f64().unwrap_or(0.) as f32,
+        a.get(2).as_f64().unwrap_or(0.) as f32,
+      )
+    }
+    if let Some(queue) = self.queue() {
+      queue.set_web_camera_follow_mesh(
+        self.id,
+        CameraFollowConfig {
+          offset: vec3(&offset),
+          up: vec3(&up),
+          fov,
+        },
+      );
     }
     Ok(())
   }

@@ -5,7 +5,12 @@
 //! errors, but the resulting mesh is still applied only after viewer creation.
 
 use crate::{
-  application::TaskQueue, camera::CameraConfig, common::*, mesh::Mesh, scene::AnimatedScene,
+  application::TaskQueue,
+  camera::CameraConfig,
+  common::*,
+  mesh::Mesh,
+  motion_lines::{MotionLineConfig, SeedSelectionAlgorithm},
+  scene::AnimatedScene,
   scene::AnimationInfo,
 };
 use mlua::{Lua, Table};
@@ -13,6 +18,13 @@ use mlua::{Lua, Table};
 fn vec3(t: Table) -> mlua::Result<Vec3> {
   // Lua arrays are one-based, unlike Rust slices and JavaScript arrays.
   Ok(Vec3::new(t.get(1)?, t.get(2)?, t.get(3)?))
+}
+
+fn color3(t: Table) -> mlua::Result<[f32; 3]> {
+  // Colors use the same one-based normalized RGB array convention as camera
+  // vectors: set_background_color({ red, green, blue }). The viewer clamps
+  // the values when the queued action is applied.
+  Ok([t.get(1)?, t.get(2)?, t.get(3)?])
 }
 
 /// Converts the format-neutral animation metadata into the Lua table shape
@@ -121,6 +133,18 @@ pub fn tasks(path: &str) -> Result<TaskQueue> {
     .set("set_camera", set_camera)
     .map_err(|e| anyhow!(e.to_string()))?;
 
+  let background = queue.clone();
+  let set_background_color = lua
+    .create_function(move |_, color: Table| {
+      background.set_background_color(color3(color)?);
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("set_background_color", set_background_color)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
   let select = queue.clone();
   let select_animation = lua
     .create_function(move |_, index: usize| {
@@ -192,6 +216,60 @@ pub fn tasks(path: &str) -> Result<TaskQueue> {
         })
         .map_err(|e| anyhow!(e.to_string()))?,
     )
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+  let all_motion_lines = queue.clone();
+  let set_motion_lines_all = lua
+    .create_function(move |_, fps: f32| {
+      all_motion_lines.configure_motion_lines(MotionLineConfig {
+        seed_selection:    SeedSelectionAlgorithm::AllVertices,
+        frames_per_second: fps,
+      });
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("set_motion_lines_all", set_motion_lines_all)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+  let random_motion_lines = queue.clone();
+  let set_motion_lines_random = lua
+    .create_function(move |_, (count, fps): (usize, f32)| {
+      random_motion_lines.configure_motion_lines(MotionLineConfig {
+        seed_selection:    SeedSelectionAlgorithm::RandomVertices { count },
+        frames_per_second: fps,
+      });
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("set_motion_lines_random", set_motion_lines_random)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+  let clear_motion_lines = queue.clone();
+  let clear_motion_lines_function = lua
+    .create_function(move |_, ()| {
+      clear_motion_lines.clear_motion_lines();
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("clear_motion_lines", clear_motion_lines_function)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+  let print_memory = queue.clone();
+  let print_memory_usage = lua
+    .create_function(move |_, label: Option<String>| {
+      print_memory.print_memory_usage(label.unwrap_or_else(|| "lua checkpoint".to_owned()));
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("print_memory_usage", print_memory_usage)
     .map_err(|e| anyhow!(e.to_string()))?;
 
   lua

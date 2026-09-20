@@ -15,6 +15,18 @@ pub struct CameraConfig {
   pub fov:    f32,
 }
 
+/// Camera pose used when the caller wants the viewer to supply the look-at
+/// point from the mesh currently displayed by the renderer.
+#[derive(Clone, Debug)]
+pub struct CameraFollowConfig {
+  /// Camera position relative to the current mesh center.
+  pub offset: Vec3,
+  /// Approximate world-space up direction used to remove roll.
+  pub up:     Vec3,
+  /// Vertical field of view in degrees.
+  pub fov:    f32,
+}
+
 /// Mutable camera state used to build the vertex shader's view-projection.
 #[derive(Clone, Debug)]
 pub struct Camera {
@@ -49,6 +61,8 @@ impl Camera {
   }
 
   /// Replaces the pose while sanitizing values that could break projection.
+  /// The caller updates the clipping planes with the bounds of the mesh it is
+  /// rendering; the camera itself does not know that mesh radius.
   ///
   /// A zero-length up vector cannot define a camera orientation, so it falls
   /// back to world up.  The FOV is clamped because extreme values make the
@@ -62,7 +76,6 @@ impl Camera {
       Vec3::Y
     };
     self.vertical_fov = config.fov.clamp(1.0, 179.0);
-    self.update_planes(1.0);
   }
 
   /// Builds the matrix that transforms world vertices into clip space.

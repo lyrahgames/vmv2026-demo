@@ -5,9 +5,10 @@
 //! calls [`Viewer::render`] when winit asks for a frame.
 
 use crate::{
-  camera::{Camera, CameraConfig},
+  camera::{Camera, CameraConfig, CameraFollowConfig},
   common::*,
   mesh::{Mesh, SkinTransform, SkinnedVertex, Vertex},
+  motion_lines::{MotionLineConfig, prepare_samples},
   scene::{AnimatedGpuMesh, AnimatedScene, AnimationInfo},
 };
 use bytemuck::{Pod, Zeroable};
@@ -15,6 +16,22 @@ use wgpu::util::DeviceExt;
 #[cfg(target_arch = "wasm32")]
 use winit::platform::web::WindowExtWebSys;
 use winit::window::Window;
+
+/// Maximum number of Catmull–Rom subdivisions available for one uniform
+/// segment. The post-process pass starts at one and doubles this only when
+/// its flatness test says that the segment needs more samples.
+const MAX_MOTION_LINE_SUBDIVISIONS: u32 = 8;
+/// Hard cap for the persistent adaptively sampled output. The cap is applied
+/// before allocation by reducing the largest per-segment subdivision level.
+const MAX_MOTION_LINE_POSTPROCESS_BYTES: u64 = 64 * 1024 * 1024;
+/// Temporary trace inputs (uniform trajectories plus sampled pose streams)
+/// coexist with the output while extraction runs. They are destroyed after
+/// submission, but this peak cap prevents a large animation from creating a
+/// transient allocation spike on a browser adapter.
+const MAX_MOTION_LINE_PEAK_BYTES: u64 = 128 * 1024 * 1024;
+/// Repeated three-point stencils suppress pose-scale jitter in the average
+/// camera target while preserving the broad root motion of the animation.
+const CAMERA_TARGET_STENCIL_PASSES: usize = 12;
 
 /// GPU buffers for an animated scene.  Geometry and indices are immutable;
 /// only the compact transform palette is uploaded as the pose changes.
@@ -29,7 +46,153 @@ struct AnimatedGpuState {
   bind:              wgpu::BindGroup,
   transforms:        Vec<SkinTransform>,
   morph_weights_cpu: Vec<f32>,
+  vertex_count:      usize,
   count:             u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MotionLineParams {
+  seed_count:          u32,
+  sample_count:        u32,
+  output_stride:       u32,
+  vertex_word_stride:  u32,
+  palette_stride:      u32,
+  morph_weight_stride: u32,
+  max_subdivisions:    u32,
+  samples_per_second:  f32,
+  duration:            f32,
+  tolerance:           f32,
+  reserved:            [f32; 3],
+  // WGSL uniform structures are rounded up to a 16-byte size. Keep the
+  // explicit tail padding in the Rust representation so the upload has the
+  // same 64-byte footprint on every backend.
+  _padding:            [u32; 3],
+}
+
+/// Visual parameters for the screen-space speedline bundle.
+///
+/// The first vector follows the old teaser's temporal weighting, the second
+/// controls the view-aligned strip and fragment depth halo, and the last
+/// vector is the physical canvas size used for pixel-constant widths. Keeping
+/// these values in one small uniform makes the effect work identically for
+/// native windows and the slide deck's WebGPU canvas.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MotionLineStyle {
+  timing:   [f32; 4], // now, visible tail duration, characteristic length, reserved
+  widths:   [f32; 4], // strip width px, max depth halo, reserved, reserved
+  viewport: [f32; 4], // physical width px, physical height px
+}
+
+/// One sample in either the uniformly traced or adaptively resampled bundle.
+/// The fields mirror the WGSL storage layout and are kept as four-component
+/// values so the GPU can address every field with the same 16-byte stride.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TrajectorySample {
+  position: [f32; 4],
+  velocity: [f32; 4],
+  normal:   [f32; 4],
+  metadata: [f32; 4], // x = time, y = arc length
+}
+
+/// GPU-resident result of tracing followed by adaptive post-processing.
+///
+/// `trajectories` is laid out seed-major with a fixed per-seed output stride;
+/// `counts` records how much of each strip the adaptive pass actually wrote.
+/// The uniform trace and sampled pose streams are transient compute inputs,
+/// so only this final bundle remains resident for rendering.
+struct MotionLineGpuState {
+  // Only the final bundle survives extraction. Seeds, sampled palettes,
+  // morph weights, raw trajectories, and their compute bind groups are
+  // temporary and are explicitly destroyed after the submitted passes.
+  trajectories:  wgpu::Buffer,
+  counts:        wgpu::Buffer,
+  params:        wgpu::Buffer,
+  style:         wgpu::Buffer,
+  line_bind:     wgpu::BindGroup,
+  seed_count:    u32,
+  output_stride: u32,
+}
+
+impl MotionLineGpuState {
+  fn destroy(self) {
+    self.trajectories.destroy();
+    self.counts.destroy();
+    self.params.destroy();
+    self.style.destroy();
+  }
+
+  fn gpu_buffer_bytes(&self) -> u64 {
+    self.trajectories.size() + self.counts.size() + self.params.size() + self.style.size()
+  }
+}
+
+/// Render targets for weighted-blended order-independent transparency.
+///
+/// Motion lines are first accumulated into a premultiplied-color/weight
+/// buffer and a multiplicative revealage buffer. A later fullscreen pass
+/// resolves those targets over the already-rendered mesh. The targets are
+/// recreated with the surface because their dimensions are presentation-size
+/// dependent.
+struct MotionLineOitTargets {
+  accumulation:      wgpu::Texture,
+  accumulation_view: wgpu::TextureView,
+  revealage:         wgpu::Texture,
+  revealage_view:    wgpu::TextureView,
+  width:             u32,
+  height:            u32,
+}
+
+impl MotionLineOitTargets {
+  fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Self {
+    let size = wgpu::Extent3d {
+      width:                 config.width.max(1),
+      height:                config.height.max(1),
+      depth_or_array_layers: 1,
+    };
+    let accumulation = device.create_texture(&wgpu::TextureDescriptor {
+      label: Some("motion-line OIT accumulation"),
+      size,
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: wgpu::TextureDimension::D2,
+      format: wgpu::TextureFormat::Rgba16Float,
+      usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+      view_formats: &[],
+    });
+    let accumulation_view = accumulation.create_view(&Default::default());
+    let revealage = device.create_texture(&wgpu::TextureDescriptor {
+      label: Some("motion-line OIT revealage"),
+      size,
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: wgpu::TextureDimension::D2,
+      format: wgpu::TextureFormat::R8Unorm,
+      usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+      view_formats: &[],
+    });
+    let revealage_view = revealage.create_view(&Default::default());
+    Self {
+      accumulation,
+      accumulation_view,
+      revealage,
+      revealage_view,
+      width: config.width.max(1),
+      height: config.height.max(1),
+    }
+  }
+
+  fn destroy(&self) {
+    self.accumulation.destroy();
+    self.revealage.destroy();
+  }
+
+  fn gpu_bytes(&self) -> u64 {
+    // Rgba16Float uses eight bytes per pixel; R8Unorm uses one.
+    self.width as u64 * self.height as u64 * (8 + 1)
+  }
 }
 
 impl AnimatedGpuState {
@@ -50,50 +213,119 @@ impl AnimatedGpuState {
 struct Uniforms {
   // The vertex shader multiplies each world-space position by this matrix.
   view_proj:   [[f32; 4]; 4],
-  // The fragment shader uses the camera position for a simple headlight.
+  // The fragment shader uses the camera position for view-dependent toon and
+  // silhouette shading.
   camera:      [f32; 4],
   // Non-sRGB browser surface formats display linear shader values too dark.
   // A value of one enables shader-side sRGB encoding for that fallback.
   encode_srgb: [f32; 4],
 }
 
+/// A pending camera orbit whose look-at target is supplied by the current
+/// animated mesh pose rather than by the scripting layer.
+#[derive(Clone, Copy)]
+struct ActiveCameraFollow {
+  offset: Vec3,
+  up:     Vec3,
+  fov:    f32,
+}
+
+/// Smooth camera target motion extracted from the average position of all
+/// surface vertices over one animation. The path is intentionally separate
+/// from the instantaneous pose bounds: an elbow or leg changing the AABB must
+/// not make the camera target jump.
+struct CameraTargetPath {
+  animation: Option<usize>,
+  duration:  f32,
+  targets:   Vec<Vec3>,
+  radius:    f32,
+}
+
+impl CameraTargetPath {
+  fn sample(&self, time: f32) -> Vec3 {
+    if self.targets.len() <= 1 || self.duration <= 0.0 {
+      return self.targets.first().copied().unwrap_or(Vec3::ZERO);
+    }
+    let wrapped = time.rem_euclid(self.duration);
+    let sample_time = if time > 0.0 && wrapped == 0.0 {
+      self.duration
+    } else {
+      wrapped
+    };
+    let normalized = (sample_time / self.duration).clamp(0.0, 1.0);
+    let position = normalized * (self.targets.len() - 1) as f32;
+    let segment = position.floor() as usize;
+    let factor = position - segment as f32;
+    let p0 = self.targets[segment.saturating_sub(1)];
+    let p1 = self.targets[segment];
+    let p2 = self.targets[(segment + 1).min(self.targets.len() - 1)];
+    let p3 = self.targets[(segment + 2).min(self.targets.len() - 1)];
+    // Uniform Catmull–Rom interpolation smooths the average trajectory while
+    // avoiding the frame-to-frame target jumps caused by pose bounds.
+    0.5
+      * ((2.0 * p1)
+        + (-p0 + p2) * factor
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * factor * factor
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * factor * factor * factor)
+  }
+}
+
 /// All GPU state needed to render one mesh into one window/canvas.
 pub struct Viewer {
   /// Public because input handling and scripted paths both update it.
-  pub camera:        Camera,
+  pub camera: Camera,
   // CPU copy retained for bounds-based camera reset and replacement.
-  mesh:              Mesh,
+  mesh: Mesh,
   // A scene is present only for glTF assets. OBJ replacement clears it so
   // stale animation state can never affect a later static mesh.
-  scene:             Option<AnimatedScene>,
-  animation_index:   Option<usize>,
-  animation_time:    f32,
-  animation_speed:   f32,
+  scene: Option<AnimatedScene>,
+  animation_index: Option<usize>,
+  animation_time: f32,
+  animation_speed: f32,
   animation_playing: bool,
+  camera_follow: Option<ActiveCameraFollow>,
+  camera_target_path: Option<CameraTargetPath>,
   // The instance is retained on wasm so the existing device can create a
   // surface for each newly visible Slidev canvas. Native applications never
   // reattach a surface after startup.
   #[cfg(target_arch = "wasm32")]
-  instance:          wgpu::Instance,
+  instance: wgpu::Instance,
   // `'static` is valid because the Arc<Window> passed to create_surface is
   // retained by AppState for at least as long as this surface.
-  surface:           Option<wgpu::Surface<'static>>,
-  device:            wgpu::Device,
-  queue:             wgpu::Queue,
-  config:            wgpu::SurfaceConfiguration,
-  pipeline:          wgpu::RenderPipeline,
+  surface: Option<wgpu::Surface<'static>>,
+  device: wgpu::Device,
+  queue: wgpu::Queue,
+  config: wgpu::SurfaceConfiguration,
+  pipeline: wgpu::RenderPipeline,
   animated_pipeline: wgpu::RenderPipeline,
-  vertex:            wgpu::Buffer,
-  index:             wgpu::Buffer,
-  count:             u32,
-  uniform:           wgpu::Buffer,
-  bind:              wgpu::BindGroup,
-  skin_layout:       wgpu::BindGroupLayout,
-  animated:          Option<AnimatedGpuState>,
-  depth:             wgpu::TextureView,
+  motion_line_pipeline: wgpu::RenderPipeline,
+  motion_composite_pipeline: wgpu::RenderPipeline,
+  motion_trace_pipeline: wgpu::ComputePipeline,
+  motion_post_pipeline: wgpu::ComputePipeline,
+  vertex: wgpu::Buffer,
+  index: wgpu::Buffer,
+  count: u32,
+  uniform: wgpu::Buffer,
+  bind: wgpu::BindGroup,
+  skin_layout: wgpu::BindGroupLayout,
+  motion_trace_layout: wgpu::BindGroupLayout,
+  motion_post_layout: wgpu::BindGroupLayout,
+  motion_line_layout: wgpu::BindGroupLayout,
+  motion_composite_layout: wgpu::BindGroupLayout,
+  motion_composite_bind: wgpu::BindGroup,
+  animated: Option<AnimatedGpuState>,
+  motion_line_config: Option<MotionLineConfig>,
+  motion_lines: Option<MotionLineGpuState>,
+  last_motion_line_peak_bytes: u64,
+  depth: wgpu::TextureView,
+  motion_oit: MotionLineOitTargets,
   // This remains constant for a surface configuration, but is written with
   // every frame beside the camera data for a simple, portable uniform ABI.
-  encode_srgb:       f32,
+  encode_srgb: f32,
+  // Linear RGB clear color selected by the native Lua or browser script.
+  // Keeping this in the viewer rather than the surface configuration makes
+  // the same script API work on native sRGB and browser UNORM surfaces.
+  background_color: [f32; 3],
 }
 
 impl Drop for Viewer {
@@ -194,6 +426,18 @@ impl Viewer {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
       label:  Some("mesh shader"),
       source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mesh.wgsl").into()),
+    });
+    let motion_trace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+      label:  Some("motion-line trace shader"),
+      source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_trace.wgsl").into()),
+    });
+    let motion_post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+      label:  Some("motion-line post-process shader"),
+      source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_postprocess.wgsl").into()),
+    });
+    let motion_line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+      label:  Some("motion-line render shader"),
+      source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_lines.wgsl").into()),
     });
     let camera = Camera::new(config.width as f32 / config.height as f32);
     // Uniforms contain one 4x4 matrix and two vec4 values (96 bytes).
@@ -337,6 +581,198 @@ impl Viewer {
       multiview:     None,
       cache:         None,
     });
+    // Motion-line extraction has its own shader module and group-zero layout.
+    // Keeping it separate from line rendering makes the required bind-group
+    // index explicit to wgpu and avoids an unused group gap at dispatch.
+    let motion_trace_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+      label:   Some("motion-line trace layout"),
+      entries: &[
+        storage_layout_entry(0, wgpu::ShaderStages::COMPUTE, true),
+        storage_layout_entry(1, wgpu::ShaderStages::COMPUTE, true),
+        storage_layout_entry(2, wgpu::ShaderStages::COMPUTE, true),
+        storage_layout_entry(3, wgpu::ShaderStages::COMPUTE, true),
+        storage_layout_entry(4, wgpu::ShaderStages::COMPUTE, true),
+        storage_layout_entry(5, wgpu::ShaderStages::COMPUTE, false),
+        uniform_layout_entry(6, wgpu::ShaderStages::COMPUTE),
+      ],
+    });
+    let motion_post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+      label:   Some("motion-line post-process layout"),
+      entries: &[
+        storage_layout_entry(0, wgpu::ShaderStages::COMPUTE, true),
+        storage_layout_entry(1, wgpu::ShaderStages::COMPUTE, false),
+        storage_layout_entry(2, wgpu::ShaderStages::COMPUTE, false),
+        uniform_layout_entry(3, wgpu::ShaderStages::COMPUTE),
+      ],
+    });
+    let motion_line_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+      label:   Some("motion-line render layout"),
+      entries: &[
+        storage_layout_entry(0, wgpu::ShaderStages::VERTEX, true),
+        uniform_layout_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+        storage_layout_entry(2, wgpu::ShaderStages::VERTEX, true),
+        uniform_layout_entry(3, wgpu::ShaderStages::VERTEX_FRAGMENT),
+      ],
+    });
+    let motion_composite_layout =
+      device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label:   Some("motion-line OIT composite layout"),
+        entries: &[
+          texture_layout_entry(0, wgpu::ShaderStages::FRAGMENT),
+          texture_layout_entry(1, wgpu::ShaderStages::FRAGMENT),
+        ],
+      });
+    let motion_trace_pipeline_layout =
+      device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label:                Some("motion-line trace pipeline layout"),
+        bind_group_layouts:   &[&motion_trace_layout],
+        push_constant_ranges: &[],
+      });
+    let motion_trace_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+      label:               Some("motion-line trace pipeline"),
+      layout:              Some(&motion_trace_pipeline_layout),
+      module:              &motion_trace_shader,
+      entry_point:         Some("trace"),
+      compilation_options: Default::default(),
+      cache:               None,
+    });
+    let motion_post_pipeline_layout =
+      device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label:                Some("motion-line post-process pipeline layout"),
+        bind_group_layouts:   &[&motion_post_layout],
+        push_constant_ranges: &[],
+      });
+    let motion_post_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+      label:               Some("motion-line post-process pipeline"),
+      layout:              Some(&motion_post_pipeline_layout),
+      module:              &motion_post_shader,
+      entry_point:         Some("postprocess"),
+      compilation_options: Default::default(),
+      cache:               None,
+    });
+    let motion_line_pipeline_layout =
+      device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label:                Some("motion-line render pipeline layout"),
+        bind_group_layouts:   &[&layout, &motion_line_layout],
+        push_constant_ranges: &[],
+      });
+    let motion_line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+      label:         Some("motion-line render pipeline"),
+      layout:        Some(&motion_line_pipeline_layout),
+      vertex:        wgpu::VertexState {
+        module:              &motion_line_shader,
+        entry_point:         Some("line_vertex"),
+        buffers:             &[],
+        compilation_options: Default::default(),
+      },
+      fragment:      Some(wgpu::FragmentState {
+        module:              &motion_line_shader,
+        entry_point:         Some("line_fragment"),
+        targets:             &[
+          Some(wgpu::ColorTargetState {
+            format:     wgpu::TextureFormat::Rgba16Float,
+            // Weighted blended OIT accumulates premultiplied color and weight
+            // independently of draw order.
+            blend:      Some(wgpu::BlendState {
+              color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation:  wgpu::BlendOperation::Add,
+              },
+              alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation:  wgpu::BlendOperation::Add,
+              },
+            }),
+            write_mask: wgpu::ColorWrites::ALL,
+          }),
+          Some(wgpu::ColorTargetState {
+            format:     wgpu::TextureFormat::R8Unorm,
+            // Revealage starts at one and is multiplied by (1 - alpha).
+            blend:      Some(wgpu::BlendState {
+              color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation:  wgpu::BlendOperation::Add,
+              },
+              alpha: wgpu::BlendComponent::REPLACE,
+            }),
+            write_mask: wgpu::ColorWrites::RED,
+          }),
+        ],
+        compilation_options: Default::default(),
+      }),
+      primitive:     wgpu::PrimitiveState {
+        // Each trajectory is emitted as one view-aligned triangle strip with
+        // two vertices per sample. Shared sample pairs connect every bend;
+        // the fragment stage applies the depth-dependent halo displacement.
+        topology: wgpu::PrimitiveTopology::TriangleStrip,
+        ..Default::default()
+      },
+      depth_stencil: Some(wgpu::DepthStencilState {
+        format:              wgpu::TextureFormat::Depth24Plus,
+        // Keep the mesh depth test, but do not let one transparent line
+        // update it before another line is accumulated. Otherwise the result
+        // would still depend on the trajectory draw order.
+        depth_write_enabled: false,
+        depth_compare:       wgpu::CompareFunction::LessEqual,
+        stencil:             Default::default(),
+        bias:                Default::default(),
+      }),
+      multisample:   Default::default(),
+      multiview:     None,
+      cache:         None,
+    });
+    let motion_composite_pipeline_layout =
+      device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label:                Some("motion-line OIT composite pipeline layout"),
+        bind_group_layouts:   &[&layout, &motion_composite_layout],
+        push_constant_ranges: &[],
+      });
+    let motion_composite_pipeline =
+      device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label:         Some("motion-line OIT composite pipeline"),
+        layout:        Some(&motion_composite_pipeline_layout),
+        vertex:        wgpu::VertexState {
+          module:              &motion_line_shader,
+          entry_point:         Some("oit_composite_vertex"),
+          buffers:             &[],
+          compilation_options: Default::default(),
+        },
+        fragment:      Some(wgpu::FragmentState {
+          module:              &motion_line_shader,
+          entry_point:         Some("oit_composite_fragment"),
+          targets:             &[Some(wgpu::ColorTargetState {
+            format,
+            // The resolved OIT color is composited over the mesh color that is
+            // already present in the swap-chain texture.
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+          })],
+          compilation_options: Default::default(),
+        }),
+        primitive:     wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample:   Default::default(),
+        multiview:     None,
+        cache:         None,
+      });
+    let motion_oit = MotionLineOitTargets::new(&device, &config);
+    let motion_composite_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label:   Some("motion-line OIT composite bind"),
+      layout:  &motion_composite_layout,
+      entries: &[
+        wgpu::BindGroupEntry {
+          binding:  0,
+          resource: wgpu::BindingResource::TextureView(&motion_oit.accumulation_view),
+        },
+        wgpu::BindGroupEntry {
+          binding:  1,
+          resource: wgpu::BindingResource::TextureView(&motion_oit.revealage_view),
+        },
+      ],
+    });
     // The mesh is retained on the CPU for camera framing, but it is not
     // uploaded here. The first queued action immediately knows whether it
     // is static or animated; uploading this bootstrap mesh would create a
@@ -368,6 +804,8 @@ impl Viewer {
       animation_time: 0.0,
       animation_speed: 1.0,
       animation_playing: false,
+      camera_follow: None,
+      camera_target_path: None,
       #[cfg(target_arch = "wasm32")]
       instance,
       surface: Some(surface),
@@ -376,18 +814,51 @@ impl Viewer {
       config,
       pipeline,
       animated_pipeline,
+      motion_line_pipeline,
+      motion_composite_pipeline,
+      motion_trace_pipeline,
+      motion_post_pipeline,
       vertex,
       index,
       count,
       uniform,
       bind,
       skin_layout,
+      motion_trace_layout,
+      motion_post_layout,
+      motion_line_layout,
+      motion_composite_layout,
+      motion_composite_bind,
       animated: None,
+      motion_line_config: None,
+      motion_lines: None,
+      last_motion_line_peak_bytes: 0,
       depth,
+      motion_oit,
       encode_srgb,
+      // White is a neutral default for the presentation and for scripts
+      // that do not need a custom backdrop.
+      background_color: [1.0, 1.0, 1.0],
     };
     s.reset_camera();
     Ok(s)
+  }
+
+  fn create_motion_composite_bind(&self) -> wgpu::BindGroup {
+    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label:   Some("motion-line OIT composite bind"),
+      layout:  &self.motion_composite_layout,
+      entries: &[
+        wgpu::BindGroupEntry {
+          binding:  0,
+          resource: wgpu::BindingResource::TextureView(&self.motion_oit.accumulation_view),
+        },
+        wgpu::BindGroupEntry {
+          binding:  1,
+          resource: wgpu::BindingResource::TextureView(&self.motion_oit.revealage_view),
+        },
+      ],
+    })
   }
 
   /// Detaches the current canvas without destroying the device or pipelines.
@@ -416,6 +887,9 @@ impl Viewer {
     self.camera.aspect = self.config.width as f32 / self.config.height as f32;
     surface.configure(&self.device, &self.config);
     self.depth = depth_view(&self.device, &self.config);
+    self.motion_oit.destroy();
+    self.motion_oit = MotionLineOitTargets::new(&self.device, &self.config);
+    self.motion_composite_bind = self.create_motion_composite_bind();
     self.surface = Some(surface);
     Ok(())
   }
@@ -432,15 +906,26 @@ impl Viewer {
         surface.configure(&self.device, &self.config);
       }
       self.depth = depth_view(&self.device, &self.config);
+      self.motion_oit.destroy();
+      self.motion_oit = MotionLineOitTargets::new(&self.device, &self.config);
+      self.motion_composite_bind = self.create_motion_composite_bind();
     }
   }
 
   /// Frames the current mesh using its precomputed bounding box.
-  pub fn reset_camera(&mut self) { self.camera.reset_for_bounds(self.mesh.min, self.mesh.max) }
+  pub fn reset_camera(&mut self) {
+    self.camera_follow = None;
+    self.camera_target_path = None;
+    self.camera.reset_for_bounds(self.mesh.min, self.mesh.max)
+  }
 
   /// Replaces the current static mesh and clears any glTF playback state.
   pub fn mesh_replace(&mut self, mesh: Mesh) {
+    self.camera_follow = None;
+    self.camera_target_path = None;
     self.scene = None;
+    self.motion_line_config = None;
+    self.clear_motion_lines();
     self.clear_animated_gpu_state();
     self.animation_index = None;
     self.animation_time = 0.0;
@@ -461,7 +946,11 @@ impl Viewer {
     // Release the old scene before converting the new one. This avoids
     // retaining two complete CPU scene graphs while the next GPU mesh is
     // being prepared.
+    self.motion_line_config = None;
+    self.clear_motion_lines();
     self.clear_animated_gpu_state();
+    self.camera_follow = None;
+    self.camera_target_path = None;
     self.scene = None;
     let gpu_mesh = scene.gpu_mesh();
     self.scene = Some(scene);
@@ -484,7 +973,9 @@ impl Viewer {
       .create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label:    Some("animated vertices"),
         contents: bytemuck::cast_slice(&mesh.vertices),
-        usage:    wgpu::BufferUsages::VERTEX,
+        // The tracing compute shader reads the same packed vertices used by
+        // the render pipeline, avoiding a second copy of the surface.
+        usage:    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
       });
     let index = self
       .device
@@ -559,6 +1050,7 @@ impl Viewer {
       bind,
       transforms: mesh.transforms,
       morph_weights_cpu: mesh.morph_weights,
+      vertex_count: mesh.vertices.len(),
       count: mesh.indices.len() as u32,
     });
   }
@@ -626,6 +1118,57 @@ impl Viewer {
     }
   }
 
+  /// Drops the currently extracted trajectory bundle and its compute inputs.
+  pub fn clear_motion_lines(&mut self) {
+    self.motion_line_config = None;
+    if let Some(lines) = self.motion_lines.take() {
+      lines.destroy();
+    }
+  }
+
+  /// Prints process RSS and the exact sizes of buffers owned by this viewer.
+  ///
+  /// wgpu deliberately does not expose portable live VRAM counters. The GPU
+  /// figure is therefore the useful lower bound of resources allocated by the
+  /// viewer (including the depth texture estimate), while CPU RSS is read from
+  /// the native process where available. Lua examples call this after queued
+  /// setup actions so the report describes the actual ready viewer.
+  pub fn print_memory_usage(&self, label: &str) {
+    let static_gpu_bytes = self.vertex.size() + self.index.size() + self.uniform.size();
+    let animated_gpu_bytes = self
+      .animated
+      .as_ref()
+      .map(|animated| {
+        animated.vertex.size()
+          + animated.index.size()
+          + animated.palette.size()
+          + animated._morph_positions.size()
+          + animated.morph_weights.size()
+      })
+      .unwrap_or(0);
+    let motion_gpu_bytes = self
+      .motion_lines
+      .as_ref()
+      .map(MotionLineGpuState::gpu_buffer_bytes)
+      .unwrap_or(0);
+    let motion_oit_bytes = self.motion_oit.gpu_bytes();
+    let depth_bytes = self.config.width as u64 * self.config.height as u64 * 4;
+    let tracked_gpu_bytes =
+      static_gpu_bytes + animated_gpu_bytes + motion_gpu_bytes + motion_oit_bytes + depth_bytes;
+    let cpu = process_rss_bytes()
+      .map(format_bytes)
+      .unwrap_or_else(|| "unavailable on this platform".to_owned());
+    eprintln!(
+      "[memory] {label}: CPU RSS {cpu}; GPU tracked {} (scene {}, motion lines {}, OIT {}, depth estimate {}); last motion-line extraction peak {}",
+      format_bytes(tracked_gpu_bytes),
+      format_bytes(static_gpu_bytes + animated_gpu_bytes),
+      format_bytes(motion_gpu_bytes),
+      format_bytes(motion_oit_bytes),
+      format_bytes(depth_bytes),
+      format_bytes(self.last_motion_line_peak_bytes),
+    );
+  }
+
   /// Returns all animations in the currently loaded glTF scene.
   pub fn animation_infos(&self) -> Vec<AnimationInfo> {
     self
@@ -646,7 +1189,13 @@ impl Viewer {
     self.animation_index = Some(index);
     self.animation_time = 0.0;
     self.animation_playing = false;
+    self.camera_target_path = None;
     self.upload_animation_pose(Some(index), 0.0);
+    if self.motion_line_config.is_some() {
+      if let Err(error) = self.rebuild_motion_lines() {
+        eprintln!("could not rebuild motion lines: {error:#}");
+      }
+    }
   }
 
   /// Starts the selected animation, defaulting to the first animation.
@@ -655,6 +1204,11 @@ impl Viewer {
       self.animation_index = Some(0);
       self.animation_time = 0.0;
       self.upload_animation_pose(Some(0), 0.0);
+      if self.motion_line_config.is_some() {
+        if let Err(error) = self.rebuild_motion_lines() {
+          eprintln!("could not rebuild motion lines: {error:#}");
+        }
+      }
     }
     self.animation_playing = self.animation_index.is_some();
   }
@@ -666,6 +1220,378 @@ impl Viewer {
   /// progression without changing the selected playing state.
   pub fn set_animation_speed(&mut self, speed: f32) { self.animation_speed = speed; }
 
+  /// Selects seeds, prepares uniform animation samples, and launches the GPU
+  /// trace plus adaptive Catmull–Rom post-process passes.
+  pub fn configure_motion_lines(&mut self, config: MotionLineConfig) -> Result<()> {
+    config.validate()?;
+    let previous = self.motion_line_config.replace(config);
+    if let Err(error) = self.rebuild_motion_lines() {
+      self.motion_line_config = previous;
+      return Err(error);
+    }
+    Ok(())
+  }
+
+  /// Prepares the sample-major palette stream, traces every selected
+  /// seed/sample pair, and then adaptively resamples each trajectory. Both
+  /// compute passes stay on the GPU; only the compact setup streams cross the
+  /// CPU/GPU boundary.
+  fn rebuild_motion_lines(&mut self) -> Result<()> {
+    let config = self
+      .motion_line_config
+      .as_ref()
+      .ok_or_else(|| anyhow!("motion-line configuration is not set"))?
+      .clone();
+    let animation = self
+      .animation_index
+      .ok_or_else(|| anyhow!("select an animation before configuring motion lines"))?;
+    let scene = self
+      .scene
+      .as_ref()
+      .ok_or_else(|| anyhow!("motion lines require an animated scene"))?;
+    let animated = self
+      .animated
+      .as_ref()
+      .ok_or_else(|| anyhow!("animated GPU geometry is not ready"))?;
+    let samples = prepare_samples(
+      scene,
+      animation,
+      animated.vertex_count,
+      animated.transforms.len(),
+      animated.morph_weights_cpu.len(),
+      &config,
+    )?;
+    let seed_count = u32::try_from(samples.seeds.len())
+      .map_err(|_| anyhow!("motion-line seed count exceeds the GPU addressable range"))?;
+    let max_storage = self.device.limits().max_storage_buffer_binding_size as u64;
+    let trajectory_sample_bytes = std::mem::size_of::<TrajectorySample>() as u64;
+    let output_budget = MAX_MOTION_LINE_POSTPROCESS_BYTES.min(max_storage);
+    let bytes_per_seed_at_minimum = (seed_count as u64)
+      .checked_mul(trajectory_sample_bytes)
+      .ok_or_else(|| anyhow!("motion-line output size overflow"))?;
+    let max_output_samples_per_seed = output_budget / bytes_per_seed_at_minimum.max(1);
+    if max_output_samples_per_seed < samples.sample_count as u64 {
+      let minimum_output_bytes = (seed_count as u64)
+        .checked_mul(samples.sample_count as u64)
+        .and_then(|count| count.checked_mul(trajectory_sample_bytes))
+        .ok_or_else(|| anyhow!("motion-line minimum output size overflow"))?;
+      bail!(
+        "motion-line uniform samples need {minimum_output_bytes} bytes, but the post-process budget is {output_budget} bytes; lower the seed count or FPS"
+      )
+    }
+    // Pick the largest power-of-two subdivision level that fits the output
+    // budget. This preserves the adaptive algorithm while preventing the
+    // previous fixed eight-way capacity from dominating long clips.
+    let segment_count = (samples.sample_count as u64).saturating_sub(1);
+    let max_steps_per_segment = if segment_count == 0 {
+      1
+    } else {
+      ((max_output_samples_per_seed.saturating_sub(1) / segment_count).max(1)) as u32
+    };
+    let mut max_subdivisions = 1_u32;
+    while max_subdivisions < MAX_MOTION_LINE_SUBDIVISIONS
+      && (max_subdivisions as u64) * 2 <= max_steps_per_segment as u64
+    {
+      max_subdivisions *= 2;
+    }
+    let output_stride = (samples.sample_count as u64)
+      .saturating_sub(1)
+      .checked_mul(max_subdivisions as u64)
+      .and_then(|count| count.checked_add(1))
+      .and_then(|count| u32::try_from(count).ok())
+      .ok_or_else(|| anyhow!("motion-line post-process output size overflow"))?;
+    let model_diagonal = (self.mesh.max - self.mesh.min).length();
+    // This is intentionally a small, model-relative geometric tolerance. It
+    // keeps straight/slow portions at their original sample density while
+    // allowing visibly curved motion to receive extra Catmull–Rom samples.
+    let tolerance = (model_diagonal * 0.002).max(1.0e-5);
+    let params = MotionLineParams {
+      seed_count,
+      sample_count: samples.sample_count,
+      output_stride,
+      vertex_word_stride: (std::mem::size_of::<SkinnedVertex>() / 4) as u32,
+      palette_stride: samples.palette_stride,
+      morph_weight_stride: samples.morph_stride,
+      max_subdivisions,
+      samples_per_second: config.frames_per_second,
+      duration: samples.duration,
+      tolerance,
+      reserved: [0.0; 3],
+      _padding: [0; 3],
+    };
+    let raw_trajectory_count = (params.seed_count as u64)
+      .checked_mul(params.sample_count as u64)
+      .ok_or_else(|| anyhow!("motion-line trajectory size overflow"))?;
+    let output_trajectory_count = (params.seed_count as u64)
+      .checked_mul(params.output_stride as u64)
+      .ok_or_else(|| anyhow!("motion-line post-process output size overflow"))?;
+    let raw_trajectory_bytes = raw_trajectory_count
+      .checked_mul(std::mem::size_of::<TrajectorySample>() as u64)
+      .ok_or_else(|| anyhow!("motion-line raw trajectory byte size overflow"))?;
+    let output_trajectory_bytes = output_trajectory_count
+      .checked_mul(std::mem::size_of::<TrajectorySample>() as u64)
+      .ok_or_else(|| anyhow!("motion-line trajectory byte size overflow"))?;
+    let count_bytes = (params.seed_count as u64)
+      .checked_mul(std::mem::size_of::<u32>() as u64)
+      .ok_or_else(|| anyhow!("motion-line count byte size overflow"))?;
+    if raw_trajectory_bytes > max_storage {
+      bail!(
+        "motion-line raw trajectory needs {raw_trajectory_bytes} bytes, but this GPU supports only {max_storage} bytes per storage binding"
+      )
+    }
+    if output_trajectory_bytes > max_storage {
+      bail!(
+        "motion-line post-process output needs {output_trajectory_bytes} bytes, but this GPU supports only {max_storage} bytes per storage binding"
+      )
+    }
+    if count_bytes > max_storage {
+      bail!(
+        "motion-line sample counts need {count_bytes} bytes, but this GPU supports only {max_storage} bytes per storage binding"
+      )
+    }
+    let palette_bytes = (samples.palettes.len() as u64)
+      .checked_mul(std::mem::size_of::<SkinTransform>() as u64)
+      .ok_or_else(|| anyhow!("motion-line palette byte size overflow"))?;
+    if palette_bytes > max_storage {
+      bail!(
+        "motion-line sample palettes need {palette_bytes} bytes, but this GPU supports only {max_storage} bytes per storage binding"
+      )
+    }
+    let morph_bytes = (samples.morph_weights.len() as u64)
+      .checked_mul(std::mem::size_of::<f32>() as u64)
+      .ok_or_else(|| anyhow!("motion-line morph-weight byte size overflow"))?;
+    if morph_bytes > max_storage {
+      bail!(
+        "motion-line sample morph weights need {morph_bytes} bytes, but this GPU supports only {max_storage} bytes per storage binding"
+      )
+    }
+    let seeds_bytes = (params.seed_count as u64)
+      .checked_mul(std::mem::size_of::<u32>() as u64)
+      .ok_or_else(|| anyhow!("motion-line seed byte size overflow"))?;
+    let style_bytes = std::mem::size_of::<MotionLineStyle>() as u64;
+    let new_motion_peak_bytes = raw_trajectory_bytes
+      .checked_add(output_trajectory_bytes)
+      .and_then(|bytes| bytes.checked_add(palette_bytes))
+      .and_then(|bytes| bytes.checked_add(morph_bytes))
+      .and_then(|bytes| bytes.checked_add(seeds_bytes))
+      .and_then(|bytes| bytes.checked_add(count_bytes))
+      .and_then(|bytes| bytes.checked_add(std::mem::size_of::<MotionLineParams>() as u64))
+      .and_then(|bytes| bytes.checked_add(style_bytes))
+      .ok_or_else(|| anyhow!("motion-line peak memory size overflow"))?;
+    let previous_motion_bytes = self
+      .motion_lines
+      .as_ref()
+      .map(MotionLineGpuState::gpu_buffer_bytes)
+      .unwrap_or(0);
+    let motion_peak_bytes = previous_motion_bytes
+      .checked_add(new_motion_peak_bytes)
+      .ok_or_else(|| anyhow!("motion-line peak memory size overflow"))?;
+    if motion_peak_bytes > MAX_MOTION_LINE_PEAK_BYTES {
+      bail!(
+        "motion-line extraction needs {new_motion_peak_bytes} bytes while the previous bundle uses {previous_motion_bytes}; the peak budget is {MAX_MOTION_LINE_PEAK_BYTES} bytes"
+      )
+    }
+    // Keep the old bundle alive until the replacement has been fully created.
+    // If validation or allocation fails, the previous visible bundle remains
+    // usable instead of leaving the viewer in a half-configured state.
+    let seeds_buffer = self
+      .device
+      .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label:    Some("motion-line seeds"),
+        contents: bytemuck::cast_slice(&samples.seeds),
+        usage:    wgpu::BufferUsages::STORAGE,
+      });
+    let palettes_buffer = self
+      .device
+      .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label:    Some("motion-line sample palettes"),
+        contents: bytemuck::cast_slice(&samples.palettes),
+        usage:    wgpu::BufferUsages::STORAGE,
+      });
+    let morph_weights_buffer = self
+      .device
+      .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label:    Some("motion-line sample morph weights"),
+        contents: bytemuck::cast_slice(&samples.morph_weights),
+        usage:    wgpu::BufferUsages::STORAGE,
+      });
+    let raw_trajectories_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+      label:              Some("motion-line uniformly sampled trajectories"),
+      size:               raw_trajectory_bytes.max(16),
+      usage:              wgpu::BufferUsages::STORAGE,
+      mapped_at_creation: false,
+    });
+    let trajectories_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+      label:              Some("motion-line adaptively sampled trajectories"),
+      size:               output_trajectory_bytes.max(16),
+      usage:              wgpu::BufferUsages::STORAGE,
+      mapped_at_creation: false,
+    });
+    let counts_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+      label:              Some("motion-line trajectory sample counts"),
+      size:               count_bytes.max(4),
+      usage:              wgpu::BufferUsages::STORAGE,
+      mapped_at_creation: false,
+    });
+    let params_buffer = self
+      .device
+      .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label:    Some("motion-line parameters"),
+        contents: bytemuck::bytes_of(&params),
+        usage:    wgpu::BufferUsages::UNIFORM,
+      });
+    let style = MotionLineStyle {
+      timing:   [0.0, 0.75, model_diagonal.max(1.0e-4), 0.0],
+      // The teaser used line_width=10 with outer coordinates +/-1.5, i.e.
+      // a 30-pixel complete strip. Use a slightly heavier 34-pixel contour
+      // for the presentation style.
+      widths:   [34.0, 0.01, 0.0, 0.0],
+      viewport: [
+        self.config.width as f32,
+        self.config.height as f32,
+        0.0,
+        0.0,
+      ],
+    };
+    let style_buffer = self
+      .device
+      .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label:    Some("motion-line style"),
+        contents: bytemuck::bytes_of(&style),
+        usage:    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+      });
+    let trace_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label:   Some("motion-line compute bind"),
+      layout:  &self.motion_trace_layout,
+      entries: &[
+        wgpu::BindGroupEntry {
+          binding:  0,
+          resource: animated.vertex.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  1,
+          resource: palettes_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  2,
+          resource: animated._morph_positions.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  3,
+          resource: morph_weights_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  4,
+          resource: seeds_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  5,
+          resource: raw_trajectories_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  6,
+          resource: params_buffer.as_entire_binding(),
+        },
+      ],
+    });
+    let post_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label:   Some("motion-line post-process bind"),
+      layout:  &self.motion_post_layout,
+      entries: &[
+        wgpu::BindGroupEntry {
+          binding:  0,
+          resource: raw_trajectories_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  1,
+          resource: trajectories_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  2,
+          resource: counts_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  3,
+          resource: params_buffer.as_entire_binding(),
+        },
+      ],
+    });
+    let line_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label:   Some("motion-line render bind"),
+      layout:  &self.motion_line_layout,
+      entries: &[
+        wgpu::BindGroupEntry {
+          binding:  0,
+          resource: trajectories_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  1,
+          resource: params_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  2,
+          resource: counts_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  3,
+          resource: style_buffer.as_entire_binding(),
+        },
+      ],
+    });
+    let mut encoder = self
+      .device
+      .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("motion-line trace and post-process"),
+      });
+    {
+      let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label:            Some("motion-line trace pass"),
+        timestamp_writes: None,
+      });
+      pass.set_pipeline(&self.motion_trace_pipeline);
+      pass.set_bind_group(0, &trace_bind, &[]);
+      pass.dispatch_workgroups(
+        (params.seed_count + 7) / 8,
+        (params.sample_count + 7) / 8,
+        1,
+      );
+    }
+    {
+      let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label:            Some("motion-line post-process pass"),
+        timestamp_writes: None,
+      });
+      pass.set_pipeline(&self.motion_post_pipeline);
+      pass.set_bind_group(0, &post_bind, &[]);
+      pass.dispatch_workgroups((params.seed_count + 63) / 64, 1, 1);
+    }
+    self.queue.submit(Some(encoder.finish()));
+    self.last_motion_line_peak_bytes = motion_peak_bytes;
+    // These inputs are consumed only by the submitted compute passes. wgpu
+    // keeps the submitted work valid after destroy(), but releasing the
+    // handles here prevents the large sampled palettes/raw bundle from
+    // remaining resident for the lifetime of the rendered line bundle.
+    drop(trace_bind);
+    drop(post_bind);
+    seeds_buffer.destroy();
+    palettes_buffer.destroy();
+    morph_weights_buffer.destroy();
+    raw_trajectories_buffer.destroy();
+    let next = MotionLineGpuState {
+      trajectories: trajectories_buffer,
+      counts: counts_buffer,
+      params: params_buffer,
+      style: style_buffer,
+      line_bind,
+      seed_count: params.seed_count,
+      output_stride: params.output_stride,
+    };
+    if let Some(previous) = self.motion_lines.replace(next) {
+      previous.destroy();
+    }
+    Ok(())
+  }
+
   /// Jumps to a time in the selected animation.
   pub fn set_animation_time(&mut self, time: f32) {
     let Some(index) = self.animation_index else {
@@ -673,6 +1599,7 @@ impl Viewer {
     };
     self.animation_time = time;
     self.upload_animation_pose(Some(index), time);
+    self.update_follow_camera();
   }
 
   /// Advances and uploads one animated frame. The vertex buffer is reused,
@@ -686,6 +1613,7 @@ impl Viewer {
     };
     self.animation_time += delta_seconds.max(0.0) * self.animation_speed;
     self.upload_animation_pose(Some(index), self.animation_time);
+    self.update_follow_camera();
   }
 
   /// Updates the GPU palette only. No animated vertex is transformed or
@@ -715,8 +1643,155 @@ impl Viewer {
     );
   }
 
-  /// Applies a script-provided camera pose.
-  pub fn set_camera(&mut self, c: CameraConfig) { self.camera.set_camera(c) }
+  /// Computes a conservative radius for the mesh bounds used by the camera's
+  /// depth range. Camera poses can move far away from the initial framing, so
+  /// using a unit radius here would clip large FBX/glTF assets.
+  fn bounds_radius(min: Vec3, max: Vec3) -> f32 { ((max - min) * 0.5).length().max(0.01) }
+
+  /// Applies a script-provided camera pose and keeps the clipping range tied
+  /// to the actual mesh rather than to a placeholder unit-sized object.
+  pub fn set_camera(&mut self, c: CameraConfig) {
+    self.camera_follow = None;
+    self.camera.set_camera(c);
+    self
+      .camera
+      .update_planes(Self::bounds_radius(self.mesh.min, self.mesh.max));
+  }
+
+  /// Builds a low-frequency path from the average position of every surface
+  /// vertex in the selected animation. Sampling the whole pose once here is
+  /// intentional: following the instantaneous AABB center makes the camera
+  /// react to individual limb poses, whereas this centroid represents the
+  /// animation's overall movement. Runtime target evaluation then only reads
+  /// this compact path and performs spline interpolation.
+  fn ensure_camera_target_path(&mut self) {
+    let Some(scene) = self.scene.as_ref() else {
+      return;
+    };
+    let animation = self.animation_index;
+    if self
+      .camera_target_path
+      .as_ref()
+      .is_some_and(|path| path.animation == animation)
+    {
+      return;
+    }
+
+    let duration = animation
+      .and_then(|index| scene.animations().get(index).map(|info| info.duration))
+      .unwrap_or(0.0)
+      .max(0.0);
+    // Thirty target samples per second are enough for a smooth Catmull–Rom
+    // camera path while keeping the one-time CPU preparation bounded.
+    let sample_count = if duration > 0.0 {
+      (duration * 30.0).ceil() as usize
+    } else {
+      0
+    };
+    let mut targets = Vec::with_capacity(sample_count + 1);
+    let mut radius = 0.01_f32;
+    for sample in 0..=sample_count {
+      let time = if sample == sample_count {
+        duration
+      } else {
+        sample as f32 / 30.0
+      };
+      let pose = scene.sample(animation, time);
+      let mut average = Vec3::ZERO;
+      for vertex in &pose.vertices {
+        average += Vec3::from_array(vertex.position);
+      }
+      if !pose.vertices.is_empty() {
+        average /= pose.vertices.len() as f32;
+      } else {
+        average = (pose.min + pose.max) * 0.5;
+      }
+      // Bound the complete pose around the centroid, not around its AABB
+      // center. This remains conservative when the centroid is offset by an
+      // asymmetric pose and gives the camera a stable far plane.
+      let pose_radius = pose
+        .vertices
+        .iter()
+        .map(|vertex| (Vec3::from_array(vertex.position) - average).length())
+        .fold(0.01, f32::max);
+      radius = radius.max(pose_radius);
+      targets.push(average);
+    }
+
+    // Apply a binomial three-point stencil repeatedly. Keeping the endpoints
+    // fixed preserves the authored first/last pose, while interior points are
+    // averaged with their temporal neighbors on every pass. This is much
+    // steadier than asking the camera to follow a freshly deformed pose box.
+    for _ in 0..CAMERA_TARGET_STENCIL_PASSES {
+      if targets.len() < 3 {
+        break;
+      }
+      let mut smoothed = targets.clone();
+      for index in 1..targets.len() - 1 {
+        smoothed[index] = (targets[index - 1] + 2.0 * targets[index] + targets[index + 1]) * 0.25;
+      }
+      targets = smoothed;
+    }
+
+    self.camera_target_path = Some(CameraTargetPath {
+      animation,
+      duration,
+      targets,
+      radius,
+    });
+  }
+
+  /// Applies a camera orbit relative to the smoothed animated centroid path.
+  /// `update_follow_camera` resolves that path after animation time advances,
+  /// so the camera tracks the overall motion rather than individual limbs.
+  pub fn set_camera_follow_mesh(&mut self, c: CameraFollowConfig) {
+    self.camera_follow = Some(ActiveCameraFollow {
+      offset: c.offset,
+      up:     c.up,
+      fov:    c.fov,
+    });
+    if !self.animation_playing {
+      self.update_follow_camera();
+    }
+  }
+
+  fn update_follow_camera(&mut self) {
+    let Some(follow) = self.camera_follow else {
+      return;
+    };
+
+    self.ensure_camera_target_path();
+    let (target, radius) = if let Some(path) = self.camera_target_path.as_ref() {
+      (path.sample(self.animation_time), path.radius)
+    } else {
+      (
+        (self.mesh.min + self.mesh.max) * 0.5,
+        Self::bounds_radius(self.mesh.min, self.mesh.max),
+      )
+    };
+    self.camera.set_camera(CameraConfig {
+      eye: target + follow.offset,
+      target,
+      up: follow.up,
+      fov: follow.fov,
+    });
+    self.camera.update_planes(radius);
+  }
+
+  /// Sets the linear RGB clear color used for the next rendered frame.
+  ///
+  /// Scripts pass normalized RGB values. Invalid or out-of-range values are
+  /// sanitized here so a malformed JavaScript/Lua value cannot poison the
+  /// surface clear operation or produce backend-specific NaNs.
+  pub fn set_background_color(&mut self, color: [f32; 3]) {
+    self.background_color = color.map(|channel| {
+      if channel.is_finite() {
+        channel.clamp(0.0, 1.0)
+      } else {
+        0.0
+      }
+    });
+  }
 
   /// Encodes and presents one frame.
   ///
@@ -746,6 +1821,14 @@ impl Viewer {
         return;
       }
     };
+    // Keep scripted, interactive, and resize-driven camera changes inside a
+    // clipping range derived from the rendered mesh. Follow-camera mode has
+    // already installed a pose-specific range after animation updates.
+    if self.camera_follow.is_none() {
+      self
+        .camera
+        .update_planes(Self::bounds_radius(self.mesh.min, self.mesh.max));
+    }
     let view = frame.texture.create_view(&Default::default());
     let m = self.camera.view_projection().to_cols_array_2d();
     // Upload the latest camera before encoding the draw call.  The same
@@ -764,22 +1847,23 @@ impl Viewer {
       .create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("render"),
       });
+    // First render the opaque mesh into the presentation target and populate
+    // the depth buffer. Motion lines are composited in later passes so their
+    // transparency can be accumulated independently of draw order.
     {
       let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label:                    Some("pass"),
+        label:                    Some("mesh pass"),
         color_attachments:        &[Some(wgpu::RenderPassColorAttachment {
           view:           &view,
           resolve_target: None,
           ops:            wgpu::Operations {
             load:  wgpu::LoadOp::Clear(wgpu::Color {
-              // On an sRGB target wgpu converts these linear
-              // values during presentation. A browser fallback
-              // UNORM target does not, so use the equivalent
-              // encoded values there to keep the background
-              // visually identical to the native viewer.
-              r: clear_channel(0.06, self.encode_srgb),
-              g: clear_channel(0.07, self.encode_srgb),
-              b: clear_channel(0.09, self.encode_srgb),
+              // On an sRGB target wgpu converts these linear values during
+              // presentation. A browser UNORM fallback receives the explicit
+              // shader-compatible encoding from clear_channel instead.
+              r: clear_channel(self.background_color[0] as f64, self.encode_srgb),
+              g: clear_channel(self.background_color[1] as f64, self.encode_srgb),
+              b: clear_channel(self.background_color[2] as f64, self.encode_srgb),
               a: 1.0,
             }),
             store: wgpu::StoreOp::Store,
@@ -798,8 +1882,8 @@ impl Viewer {
       });
       pass.set_bind_group(0, &self.bind, &[]);
       if let Some(animated) = &self.animated {
-        // Animated geometry stays immutable; bind the current pose
-        // palette and let the vertex shader perform skinning.
+        // Animated geometry stays immutable; bind the current pose palette
+        // and let the vertex shader perform skinning.
         pass.set_pipeline(&self.animated_pipeline);
         pass.set_bind_group(1, &animated.bind, &[]);
         pass.set_vertex_buffer(0, animated.vertex.slice(..));
@@ -810,6 +1894,113 @@ impl Viewer {
         pass.set_vertex_buffer(0, self.vertex.slice(..));
         pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.count, 0, 0..1);
+      }
+    }
+
+    if let Some(lines) = &self.motion_lines {
+      // The extracted bundle is complete, but the teaser style displays a
+      // moving temporal tail. Updating this tiny uniform is enough to animate
+      // the style without rebuilding or copying the trajectories.
+      let duration = self
+        .animation_index
+        .and_then(|index| {
+          self
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.animations().get(index).map(|info| info.duration))
+        })
+        .map(|duration| duration.max(0.0))
+        .unwrap_or(0.0);
+      let now = if duration > 0.0 {
+        self.animation_time.rem_euclid(duration)
+      } else {
+        0.0
+      };
+      let model_diagonal = (self.mesh.max - self.mesh.min).length().max(1.0e-4);
+      self.queue.write_buffer(
+        &lines.style,
+        0,
+        bytemuck::bytes_of(&MotionLineStyle {
+          timing:   [now, 0.75, model_diagonal, 0.0],
+          // The original teaser used a 10-pixel half-width parameter with
+          // outer coordinates at +/-1.5. This slightly larger normalized
+          // strip restores that visibly heavier contour.
+          widths:   [34.0, 0.01, 0.0, 0.0],
+          viewport: [
+            self.config.width as f32,
+            self.config.height as f32,
+            0.0,
+            0.0,
+          ],
+        }),
+      );
+
+      // Accumulate every line into the two weighted OIT targets. The depth
+      // attachment remains the mesh depth, so surface occlusion still works.
+      {
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+          label:                    Some("motion-line weighted OIT pass"),
+          color_attachments:        &[
+            Some(wgpu::RenderPassColorAttachment {
+              view:           &self.motion_oit.accumulation_view,
+              resolve_target: None,
+              ops:            wgpu::Operations {
+                load:  wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+              },
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+              view:           &self.motion_oit.revealage_view,
+              resolve_target: None,
+              ops:            wgpu::Operations {
+                load:  wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                store: wgpu::StoreOp::Store,
+              },
+            }),
+          ],
+          depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view:        &self.depth,
+            depth_ops:   Some(wgpu::Operations {
+              load:  wgpu::LoadOp::Load,
+              store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+          }),
+          occlusion_query_set:      None,
+          timestamp_writes:         None,
+        });
+        pass.set_pipeline(&self.motion_line_pipeline);
+        pass.set_bind_group(0, &self.bind, &[]);
+        pass.set_bind_group(1, &lines.line_bind, &[]);
+        // Two vertices per trajectory sample form one continuous strip per
+        // instance. Invalid fixed-capacity tail samples duplicate the last
+        // real sample and are discarded by the fragment stage.
+        let strip_vertices = lines.output_stride.saturating_mul(2);
+        pass.draw(0..strip_vertices, 0..lines.seed_count);
+      }
+
+      // Resolve the weighted average and revealage into the presentation
+      // target. The composite itself uses ordinary alpha blending only once;
+      // the expensive order-dependent line overlap has already been removed.
+      {
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+          label:                    Some("motion-line OIT composite pass"),
+          color_attachments:        &[Some(wgpu::RenderPassColorAttachment {
+            view:           &view,
+            resolve_target: None,
+            ops:            wgpu::Operations {
+              load:  wgpu::LoadOp::Load,
+              store: wgpu::StoreOp::Store,
+            },
+          })],
+          depth_stencil_attachment: None,
+          occlusion_query_set:      None,
+          timestamp_writes:         None,
+        });
+        pass.set_pipeline(&self.motion_composite_pipeline);
+        pass.set_bind_group(0, &self.bind, &[]);
+        pass.set_bind_group(1, &self.motion_composite_bind, &[]);
+        pass.draw(0..3, 0..1);
       }
     }
     // Submit commands first, then present the acquired swap-chain frame.
@@ -832,6 +2023,82 @@ fn clear_channel(linear: f64, encode_srgb: f32) -> f64 {
     }
   } else {
     linear
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn process_rss_bytes() -> Option<u64> {
+  let status = std::fs::read_to_string("/proc/self/status").ok()?;
+  let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+  let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+  kib.checked_mul(1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_rss_bytes() -> Option<u64> { None }
+
+fn format_bytes(bytes: u64) -> String {
+  const KIB: f64 = 1024.0;
+  const MIB: f64 = KIB * 1024.0;
+  const GIB: f64 = MIB * 1024.0;
+  let bytes_f = bytes as f64;
+  if bytes_f >= GIB {
+    format!("{:.2} GiB", bytes_f / GIB)
+  } else if bytes_f >= MIB {
+    format!("{:.2} MiB", bytes_f / MIB)
+  } else if bytes_f >= KIB {
+    format!("{:.2} KiB", bytes_f / KIB)
+  } else {
+    format!("{} B", bytes)
+  }
+}
+
+fn storage_layout_entry(
+  binding: u32,
+  visibility: wgpu::ShaderStages,
+  read_only: bool,
+) -> wgpu::BindGroupLayoutEntry {
+  wgpu::BindGroupLayoutEntry {
+    binding,
+    visibility,
+    ty: wgpu::BindingType::Buffer {
+      ty:                 wgpu::BufferBindingType::Storage { read_only },
+      has_dynamic_offset: false,
+      min_binding_size:   None,
+    },
+    count: None,
+  }
+}
+
+fn uniform_layout_entry(
+  binding: u32,
+  visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+  wgpu::BindGroupLayoutEntry {
+    binding,
+    visibility,
+    ty: wgpu::BindingType::Buffer {
+      ty:                 wgpu::BufferBindingType::Uniform,
+      has_dynamic_offset: false,
+      min_binding_size:   None,
+    },
+    count: None,
+  }
+}
+
+fn texture_layout_entry(
+  binding: u32,
+  visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+  wgpu::BindGroupLayoutEntry {
+    binding,
+    visibility,
+    ty: wgpu::BindingType::Texture {
+      sample_type:    wgpu::TextureSampleType::Float { filterable: false },
+      view_dimension: wgpu::TextureViewDimension::D2,
+      multisampled:   false,
+    },
+    count: None,
   }
 }
 
