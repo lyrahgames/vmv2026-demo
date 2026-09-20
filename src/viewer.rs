@@ -32,6 +32,11 @@ const MAX_MOTION_LINE_PEAK_BYTES: u64 = 128 * 1024 * 1024;
 /// Repeated three-point stencils suppress pose-scale jitter in the average
 /// camera target while preserving the broad root motion of the animation.
 const CAMERA_TARGET_STENCIL_PASSES: usize = 12;
+/// Four samples per pixel is the portable WebGPU/native MSAA level. The
+/// renderer checks every format used by the scene and OIT passes before
+/// enabling it, falling back to one sample only on adapters that cannot
+/// resolve all of those formats.
+const PREFERRED_MSAA_SAMPLE_COUNT: u32 = 4;
 
 /// GPU buffers for an animated scene.  Geometry and indices are immutable;
 /// only the compact transform palette is uploaded as the pose changes.
@@ -137,16 +142,24 @@ impl MotionLineGpuState {
 /// recreated with the surface because their dimensions are presentation-size
 /// dependent.
 struct MotionLineOitTargets {
-  accumulation:      wgpu::Texture,
-  accumulation_view: wgpu::TextureView,
-  revealage:         wgpu::Texture,
-  revealage_view:    wgpu::TextureView,
-  width:             u32,
-  height:            u32,
+  // Single-sampled textures are the inputs to the fullscreen composite pass.
+  accumulation:           wgpu::Texture,
+  accumulation_view:      wgpu::TextureView,
+  revealage:              wgpu::Texture,
+  revealage_view:         wgpu::TextureView,
+  // The line pass writes these multisampled attachments and resolves into the
+  // textures above. They remain optional for the safe one-sample fallback.
+  accumulation_msaa:      Option<wgpu::Texture>,
+  accumulation_msaa_view: Option<wgpu::TextureView>,
+  revealage_msaa:         Option<wgpu::Texture>,
+  revealage_msaa_view:    Option<wgpu::TextureView>,
+  sample_count:           u32,
+  width:                  u32,
+  height:                 u32,
 }
 
 impl MotionLineOitTargets {
-  fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Self {
+  fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration, sample_count: u32) -> Self {
     let size = wgpu::Extent3d {
       width:                 config.width.max(1),
       height:                config.height.max(1),
@@ -163,6 +176,22 @@ impl MotionLineOitTargets {
       view_formats: &[],
     });
     let accumulation_view = accumulation.create_view(&Default::default());
+    let (accumulation_msaa, accumulation_msaa_view) = if sample_count > 1 {
+      let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("motion-line OIT accumulation MSAA"),
+        size,
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+      });
+      let view = texture.create_view(&Default::default());
+      (Some(texture), Some(view))
+    } else {
+      (None, None)
+    };
     let revealage = device.create_texture(&wgpu::TextureDescriptor {
       label: Some("motion-line OIT revealage"),
       size,
@@ -174,11 +203,32 @@ impl MotionLineOitTargets {
       view_formats: &[],
     });
     let revealage_view = revealage.create_view(&Default::default());
+    let (revealage_msaa, revealage_msaa_view) = if sample_count > 1 {
+      let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("motion-line OIT revealage MSAA"),
+        size,
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+      });
+      let view = texture.create_view(&Default::default());
+      (Some(texture), Some(view))
+    } else {
+      (None, None)
+    };
     Self {
       accumulation,
       accumulation_view,
       revealage,
       revealage_view,
+      accumulation_msaa,
+      accumulation_msaa_view,
+      revealage_msaa,
+      revealage_msaa_view,
+      sample_count,
       width: config.width.max(1),
       height: config.height.max(1),
     }
@@ -187,11 +237,20 @@ impl MotionLineOitTargets {
   fn destroy(&self) {
     self.accumulation.destroy();
     self.revealage.destroy();
+    if let Some(texture) = &self.accumulation_msaa {
+      texture.destroy();
+    }
+    if let Some(texture) = &self.revealage_msaa {
+      texture.destroy();
+    }
   }
 
   fn gpu_bytes(&self) -> u64 {
-    // Rgba16Float uses eight bytes per pixel; R8Unorm uses one.
-    self.width as u64 * self.height as u64 * (8 + 1)
+    // Rgba16Float uses eight bytes per pixel; R8Unorm uses one. The resolved
+    // textures are always present; MSAA attachments multiply the extra copy
+    // by their actual sample count.
+    let pixels = self.width as u64 * self.height as u64;
+    pixels * (8 + 1) * (1 + u64::from(self.sample_count > 1) * self.sample_count as u64)
   }
 }
 
@@ -317,6 +376,10 @@ pub struct Viewer {
   motion_line_config: Option<MotionLineConfig>,
   motion_lines: Option<MotionLineGpuState>,
   last_motion_line_peak_bytes: u64,
+  // MSAA color is resolved into the acquired surface texture. The depth
+  // attachment and every geometry pipeline use the same sample count.
+  sample_count: u32,
+  msaa_color: Option<wgpu::TextureView>,
   depth: wgpu::TextureView,
   motion_oit: MotionLineOitTargets,
   // This remains constant for a surface configuration, but is written with
@@ -405,6 +468,7 @@ impl Viewer {
     // canvases expose only an UNORM target. The shader needs to encode its
     // linear lighting output itself in the latter case.
     let encode_srgb = (!format.is_srgb()) as u8 as f32;
+    let sample_count = choose_msaa_sample_count(&adapter, format);
     let alpha_mode = caps
       .alpha_modes
       .first()
@@ -503,7 +567,7 @@ impl Viewer {
         stencil:             Default::default(),
         bias:                Default::default(),
       }),
-      multisample:   Default::default(),
+      multisample:   multisample_state(sample_count),
       multiview:     None,
       cache:         None,
     });
@@ -577,7 +641,7 @@ impl Viewer {
         stencil:             Default::default(),
         bias:                Default::default(),
       }),
-      multisample:   Default::default(),
+      multisample:   multisample_state(sample_count),
       multiview:     None,
       cache:         None,
     });
@@ -720,7 +784,7 @@ impl Viewer {
         stencil:             Default::default(),
         bias:                Default::default(),
       }),
-      multisample:   Default::default(),
+      multisample:   multisample_state(sample_count),
       multiview:     None,
       cache:         None,
     });
@@ -758,7 +822,7 @@ impl Viewer {
         multiview:     None,
         cache:         None,
       });
-    let motion_oit = MotionLineOitTargets::new(&device, &config);
+    let motion_oit = MotionLineOitTargets::new(&device, &config, sample_count);
     let motion_composite_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
       label:   Some("motion-line OIT composite bind"),
       layout:  &motion_composite_layout,
@@ -794,7 +858,8 @@ impl Viewer {
       contents: bytemuck::cast_slice(&placeholder_indices),
       usage:    wgpu::BufferUsages::INDEX,
     });
-    let depth = depth_view(&device, &config);
+    let msaa_color = msaa_color_view(&device, &config, format, sample_count);
+    let depth = depth_view(&device, &config, sample_count);
     let count = 0;
     let mut s = Self {
       camera,
@@ -833,6 +898,8 @@ impl Viewer {
       motion_line_config: None,
       motion_lines: None,
       last_motion_line_peak_bytes: 0,
+      sample_count,
+      msaa_color,
       depth,
       motion_oit,
       encode_srgb,
@@ -886,9 +953,15 @@ impl Viewer {
     self.config.height = size.height.max(1);
     self.camera.aspect = self.config.width as f32 / self.config.height as f32;
     surface.configure(&self.device, &self.config);
-    self.depth = depth_view(&self.device, &self.config);
+    self.msaa_color = msaa_color_view(
+      &self.device,
+      &self.config,
+      self.config.format,
+      self.sample_count,
+    );
+    self.depth = depth_view(&self.device, &self.config, self.sample_count);
     self.motion_oit.destroy();
-    self.motion_oit = MotionLineOitTargets::new(&self.device, &self.config);
+    self.motion_oit = MotionLineOitTargets::new(&self.device, &self.config, self.sample_count);
     self.motion_composite_bind = self.create_motion_composite_bind();
     self.surface = Some(surface);
     Ok(())
@@ -905,9 +978,15 @@ impl Viewer {
       if let Some(surface) = &self.surface {
         surface.configure(&self.device, &self.config);
       }
-      self.depth = depth_view(&self.device, &self.config);
+      self.msaa_color = msaa_color_view(
+        &self.device,
+        &self.config,
+        self.config.format,
+        self.sample_count,
+      );
+      self.depth = depth_view(&self.device, &self.config, self.sample_count);
       self.motion_oit.destroy();
-      self.motion_oit = MotionLineOitTargets::new(&self.device, &self.config);
+      self.motion_oit = MotionLineOitTargets::new(&self.device, &self.config, self.sample_count);
       self.motion_composite_bind = self.create_motion_composite_bind();
     }
   }
@@ -1152,19 +1231,34 @@ impl Viewer {
       .map(MotionLineGpuState::gpu_buffer_bytes)
       .unwrap_or(0);
     let motion_oit_bytes = self.motion_oit.gpu_bytes();
-    let depth_bytes = self.config.width as u64 * self.config.height as u64 * 4;
-    let tracked_gpu_bytes =
-      static_gpu_bytes + animated_gpu_bytes + motion_gpu_bytes + motion_oit_bytes + depth_bytes;
+    let pixels = self.config.width as u64 * self.config.height as u64;
+    let depth_bytes = pixels * 4 * self.sample_count as u64;
+    // Surface formats used by the presentation path are normally four bytes
+    // per pixel. This estimate includes the private multisampled color target
+    // but intentionally does not pretend to know the driver's swap-chain size.
+    let msaa_color_bytes = if self.sample_count > 1 {
+      pixels * 4 * self.sample_count as u64
+    } else {
+      0
+    };
+    let tracked_gpu_bytes = static_gpu_bytes
+      + animated_gpu_bytes
+      + motion_gpu_bytes
+      + motion_oit_bytes
+      + depth_bytes
+      + msaa_color_bytes;
     let cpu = process_rss_bytes()
       .map(format_bytes)
       .unwrap_or_else(|| "unavailable on this platform".to_owned());
     eprintln!(
-      "[memory] {label}: CPU RSS {cpu}; GPU tracked {} (scene {}, motion lines {}, OIT {}, depth estimate {}); last motion-line extraction peak {}",
+      "[memory] {label}: CPU RSS {cpu}; GPU tracked {} (scene {}, motion lines {}, OIT {}, MSAA color {}, depth {}, {}x); last motion-line extraction peak {}",
       format_bytes(tracked_gpu_bytes),
       format_bytes(static_gpu_bytes + animated_gpu_bytes),
       format_bytes(motion_gpu_bytes),
       format_bytes(motion_oit_bytes),
+      format_bytes(msaa_color_bytes),
       format_bytes(depth_bytes),
+      self.sample_count,
       format_bytes(self.last_motion_line_peak_bytes),
     );
   }
@@ -1847,15 +1941,15 @@ impl Viewer {
       .create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("render"),
       });
-    // First render the opaque mesh into the presentation target and populate
-    // the depth buffer. Motion lines are composited in later passes so their
-    // transparency can be accumulated independently of draw order.
+    // First render the opaque mesh into an MSAA target and resolve it into the
+    // presentation texture. Motion lines are composited in later passes so
+    // their transparency can be accumulated independently of draw order.
     {
       let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
         label:                    Some("mesh pass"),
         color_attachments:        &[Some(wgpu::RenderPassColorAttachment {
-          view:           &view,
-          resolve_target: None,
+          view:           self.msaa_color.as_ref().unwrap_or(&view),
+          resolve_target: (self.sample_count > 1).then_some(&view),
           ops:            wgpu::Operations {
             load:  wgpu::LoadOp::Clear(wgpu::Color {
               // On an sRGB target wgpu converts these linear values during
@@ -1942,16 +2036,24 @@ impl Viewer {
           label:                    Some("motion-line weighted OIT pass"),
           color_attachments:        &[
             Some(wgpu::RenderPassColorAttachment {
-              view:           &self.motion_oit.accumulation_view,
-              resolve_target: None,
+              view:           self
+                .motion_oit
+                .accumulation_msaa_view
+                .as_ref()
+                .unwrap_or(&self.motion_oit.accumulation_view),
+              resolve_target: (self.sample_count > 1).then_some(&self.motion_oit.accumulation_view),
               ops:            wgpu::Operations {
                 load:  wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                 store: wgpu::StoreOp::Store,
               },
             }),
             Some(wgpu::RenderPassColorAttachment {
-              view:           &self.motion_oit.revealage_view,
-              resolve_target: None,
+              view:           self
+                .motion_oit
+                .revealage_msaa_view
+                .as_ref()
+                .unwrap_or(&self.motion_oit.revealage_view),
+              resolve_target: (self.sample_count > 1).then_some(&self.motion_oit.revealage_view),
               ops:            wgpu::Operations {
                 load:  wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                 store: wgpu::StoreOp::Store,
@@ -2102,23 +2204,91 @@ fn texture_layout_entry(
   }
 }
 
-/// Creates the depth buffer matching the current surface dimensions.
-fn depth_view(device: &wgpu::Device, c: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+/// Selects MSAA only when every attachment participating in a resolved render
+/// pass supports it. This keeps the browser path valid on WebGPU adapters with
+/// unusual float or revealage format capabilities instead of failing during
+/// pipeline or texture validation.
+fn choose_msaa_sample_count(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) -> u32 {
+  let formats = [
+    surface_format,
+    wgpu::TextureFormat::Rgba16Float,
+    wgpu::TextureFormat::R8Unorm,
+    wgpu::TextureFormat::Depth24Plus,
+  ];
+  let supported = formats.iter().all(|format| {
+    let flags = adapter.get_texture_format_features(*format).flags;
+    flags.sample_count_supported(PREFERRED_MSAA_SAMPLE_COUNT)
+      && (*format == wgpu::TextureFormat::Depth24Plus
+        || flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE))
+  });
+  if supported {
+    PREFERRED_MSAA_SAMPLE_COUNT
+  } else {
+    1
+  }
+}
+
+fn multisample_state(sample_count: u32) -> wgpu::MultisampleState {
+  wgpu::MultisampleState {
+    count: sample_count,
+    mask: !0,
+    alpha_to_coverage_enabled: false,
+  }
+}
+
+/// Creates the color target used for multisampled mesh rendering. The view is
+/// kept separately from the acquired surface because swap-chain textures are
+/// always single-sampled and can only be used as resolve targets.
+fn msaa_color_view(
+  device: &wgpu::Device,
+  c: &wgpu::SurfaceConfiguration,
+  format: wgpu::TextureFormat,
+  sample_count: u32,
+) -> Option<wgpu::TextureView> {
+  if sample_count <= 1 {
+    return None;
+  }
+  Some(
+    device
+      .create_texture(&wgpu::TextureDescriptor {
+        label: Some("mesh MSAA color"),
+        size: wgpu::Extent3d {
+          width:                 c.width,
+          height:                c.height,
+          depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+      })
+      .create_view(&Default::default()),
+  )
+}
+
+/// Creates the depth buffer matching the current surface dimensions and the
+/// color attachments' sample count.
+fn depth_view(
+  device: &wgpu::Device,
+  c: &wgpu::SurfaceConfiguration,
+  sample_count: u32,
+) -> wgpu::TextureView {
   device
     .create_texture(&wgpu::TextureDescriptor {
-      label:           Some("depth"),
-      size:            wgpu::Extent3d {
+      label: Some("depth"),
+      size: wgpu::Extent3d {
         width:                 c.width,
         height:                c.height,
         depth_or_array_layers: 1,
       },
       mip_level_count: 1,
-      sample_count:    1,
-      dimension:       wgpu::TextureDimension::D2,
-      format:          wgpu::TextureFormat::Depth24Plus,
-      usage:           wgpu::TextureUsages::RENDER_ATTACHMENT
-        | wgpu::TextureUsages::TEXTURE_BINDING,
-      view_formats:    &[],
+      sample_count,
+      dimension: wgpu::TextureDimension::D2,
+      format: wgpu::TextureFormat::Depth24Plus,
+      usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+      view_formats: &[],
     })
     .create_view(&Default::default())
 }
