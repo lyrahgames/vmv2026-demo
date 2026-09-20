@@ -8,7 +8,9 @@ use crate::{
   camera::{Camera, CameraConfig, CameraFollowConfig},
   common::*,
   mesh::{Mesh, SkinTransform, SkinnedVertex, Vertex},
-  motion_lines::{MotionLineConfig, prepare_samples},
+  motion_lines::{
+    MotionLineConfig, PoseSamples, SeedSelectionAlgorithm, prepare_pose_samples, prepare_samples,
+  },
   scene::{AnimatedGpuMesh, AnimatedScene, AnimationInfo},
 };
 use bytemuck::{Pod, Zeroable};
@@ -29,6 +31,15 @@ const MAX_MOTION_LINE_POSTPROCESS_BYTES: u64 = 64 * 1024 * 1024;
 /// submission, but this peak cap prevents a large animation from creating a
 /// transient allocation spike on a browser adapter.
 const MAX_MOTION_LINE_PEAK_BYTES: u64 = 128 * 1024 * 1024;
+/// Maximum temporary position-stream allocation for spacetime seed selection.
+/// Unlike the final trajectory bundle this stream contains only one vec4 per
+/// vertex/time pair and is destroyed immediately after the seed indices have
+/// been generated.
+const MAX_SPACETIME_SEED_POSITION_BYTES: u64 = 64 * 1024 * 1024;
+/// The greedy spacetime selector needs one dependent GPU submission per
+/// promoted seed. This guard prevents an accidental request for tens of
+/// thousands of seeds from flooding the queue with dependent submissions.
+const MAX_SPACETIME_SELECTION_PASSES: u64 = 4096;
 /// Repeated three-point stencils suppress pose-scale jitter in the average
 /// camera target while preserving the broad root motion of the animation.
 const CAMERA_TARGET_STENCIL_PASSES: usize = 12;
@@ -73,6 +84,30 @@ struct MotionLineParams {
   // explicit tail padding in the Rust representation so the upload has the
   // same 64-byte footprint on every backend.
   _padding:            [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SpacetimeSeedTraceParams {
+  vertex_count:        u32,
+  sample_count:        u32,
+  vertex_word_stride:  u32,
+  palette_stride:      u32,
+  morph_weight_stride: u32,
+  samples_per_second:  f32,
+  duration:            f32,
+  _padding:            [u32; 1],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SpacetimeSeedSelectionParams {
+  vertex_count:   u32,
+  sample_count:   u32,
+  seed_count:     u32,
+  stage:          u32,
+  selected_count: u32,
+  _padding:       [u32; 3],
 }
 
 /// Visual parameters for the screen-space speedline bundle.
@@ -361,6 +396,8 @@ pub struct Viewer {
   motion_composite_pipeline: wgpu::RenderPipeline,
   motion_trace_pipeline: wgpu::ComputePipeline,
   motion_post_pipeline: wgpu::ComputePipeline,
+  motion_seed_trace_pipeline: wgpu::ComputePipeline,
+  motion_seed_selection_pipeline: wgpu::ComputePipeline,
   vertex: wgpu::Buffer,
   index: wgpu::Buffer,
   count: u32,
@@ -369,6 +406,8 @@ pub struct Viewer {
   skin_layout: wgpu::BindGroupLayout,
   motion_trace_layout: wgpu::BindGroupLayout,
   motion_post_layout: wgpu::BindGroupLayout,
+  motion_seed_trace_layout: wgpu::BindGroupLayout,
+  motion_seed_selection_layout: wgpu::BindGroupLayout,
   motion_line_layout: wgpu::BindGroupLayout,
   motion_composite_layout: wgpu::BindGroupLayout,
   motion_composite_bind: wgpu::BindGroup,
@@ -494,6 +533,16 @@ impl Viewer {
     let motion_trace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
       label:  Some("motion-line trace shader"),
       source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_trace.wgsl").into()),
+    });
+    let motion_seed_trace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+      label:  Some("motion-line spacetime seed trace shader"),
+      source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_seed_trace.wgsl").into()),
+    });
+    let motion_seed_selection_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+      label:  Some("motion-line spacetime seed selection shader"),
+      source: wgpu::ShaderSource::Wgsl(
+        include_str!("../shaders/motion_seed_selection.wgsl").into(),
+      ),
     });
     let motion_post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
       label:  Some("motion-line post-process shader"),
@@ -660,6 +709,30 @@ impl Viewer {
         uniform_layout_entry(6, wgpu::ShaderStages::COMPUTE),
       ],
     });
+    let motion_seed_trace_layout =
+      device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label:   Some("motion-line spacetime seed trace layout"),
+        entries: &[
+          storage_layout_entry(0, wgpu::ShaderStages::COMPUTE, true),
+          storage_layout_entry(1, wgpu::ShaderStages::COMPUTE, true),
+          storage_layout_entry(2, wgpu::ShaderStages::COMPUTE, true),
+          storage_layout_entry(3, wgpu::ShaderStages::COMPUTE, true),
+          storage_layout_entry(4, wgpu::ShaderStages::COMPUTE, false),
+          uniform_layout_entry(5, wgpu::ShaderStages::COMPUTE),
+        ],
+      });
+    let motion_seed_selection_layout =
+      device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label:   Some("motion-line spacetime seed selection layout"),
+        entries: &[
+          storage_layout_entry(0, wgpu::ShaderStages::COMPUTE, true),
+          storage_layout_entry(1, wgpu::ShaderStages::COMPUTE, false),
+          storage_layout_entry(2, wgpu::ShaderStages::COMPUTE, false),
+          storage_layout_entry(3, wgpu::ShaderStages::COMPUTE, false),
+          storage_layout_entry(4, wgpu::ShaderStages::COMPUTE, false),
+          uniform_layout_entry(5, wgpu::ShaderStages::COMPUTE),
+        ],
+      });
     let motion_post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
       label:   Some("motion-line post-process layout"),
       entries: &[
@@ -700,6 +773,36 @@ impl Viewer {
       compilation_options: Default::default(),
       cache:               None,
     });
+    let motion_seed_trace_pipeline_layout =
+      device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label:                Some("motion-line spacetime seed trace pipeline layout"),
+        bind_group_layouts:   &[&motion_seed_trace_layout],
+        push_constant_ranges: &[],
+      });
+    let motion_seed_trace_pipeline =
+      device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label:               Some("motion-line spacetime seed trace pipeline"),
+        layout:              Some(&motion_seed_trace_pipeline_layout),
+        module:              &motion_seed_trace_shader,
+        entry_point:         Some("trace"),
+        compilation_options: Default::default(),
+        cache:               None,
+      });
+    let motion_seed_selection_pipeline_layout =
+      device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label:                Some("motion-line spacetime seed selection pipeline layout"),
+        bind_group_layouts:   &[&motion_seed_selection_layout],
+        push_constant_ranges: &[],
+      });
+    let motion_seed_selection_pipeline =
+      device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label:               Some("motion-line spacetime seed selection pipeline"),
+        layout:              Some(&motion_seed_selection_pipeline_layout),
+        module:              &motion_seed_selection_shader,
+        entry_point:         Some("select"),
+        compilation_options: Default::default(),
+        cache:               None,
+      });
     let motion_post_pipeline_layout =
       device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label:                Some("motion-line post-process pipeline layout"),
@@ -883,6 +986,8 @@ impl Viewer {
       motion_composite_pipeline,
       motion_trace_pipeline,
       motion_post_pipeline,
+      motion_seed_trace_pipeline,
+      motion_seed_selection_pipeline,
       vertex,
       index,
       count,
@@ -891,6 +996,8 @@ impl Viewer {
       skin_layout,
       motion_trace_layout,
       motion_post_layout,
+      motion_seed_trace_layout,
+      motion_seed_selection_layout,
       motion_line_layout,
       motion_composite_layout,
       motion_composite_bind,
@@ -1326,6 +1433,328 @@ impl Viewer {
     Ok(())
   }
 
+  /// Traces every animated vertex at the low rate requested by spacetime
+  /// seeding and selects the max-min seed set on the GPU. Only the resulting
+  /// seed-index buffer survives this method; the all-vertex position stream,
+  /// low-rate palettes, and temporary bind groups are destroyed immediately
+  /// after their command submission.
+  fn trace_spacetime_seed_selection(
+    &mut self,
+    pose: &PoseSamples,
+    vertex_count: usize,
+    seed_count: u32,
+    sampling_rate: f32,
+  ) -> Result<wgpu::Buffer> {
+    if vertex_count == 0 || seed_count == 0 {
+      bail!("uniform spacetime selection requires at least one source vertex")
+    }
+    let vertex_count_u32 = u32::try_from(vertex_count)
+      .map_err(|_| anyhow!("spacetime seed vertex count exceeds the GPU addressable range"))?;
+    let max_storage = self.device.limits().max_storage_buffer_binding_size as u64;
+    let position_count = (vertex_count_u32 as u64)
+      .checked_mul(pose.sample_count as u64)
+      .ok_or_else(|| anyhow!("spacetime seed position count overflow"))?;
+    let position_bytes = position_count
+      .checked_mul(std::mem::size_of::<[f32; 4]>() as u64)
+      .ok_or_else(|| anyhow!("spacetime seed position buffer size overflow"))?;
+    let position_budget = MAX_SPACETIME_SEED_POSITION_BYTES.min(max_storage);
+    if position_bytes > position_budget {
+      bail!(
+        "uniform spacetime seed positions need {position_bytes} bytes, but the temporary budget is {position_budget} bytes; lower the seed sampling rate"
+      )
+    }
+    let palette_bytes = (pose.palettes.len() as u64)
+      .checked_mul(std::mem::size_of::<SkinTransform>() as u64)
+      .ok_or_else(|| anyhow!("spacetime seed palette size overflow"))?;
+    if palette_bytes > max_storage {
+      bail!(
+        "uniform spacetime seed palettes need {palette_bytes} bytes, but this GPU supports only {max_storage} bytes per storage binding"
+      )
+    }
+    let morph_bytes = (pose.morph_weights.len() as u64)
+      .checked_mul(std::mem::size_of::<f32>() as u64)
+      .ok_or_else(|| anyhow!("spacetime seed morph-weight size overflow"))?;
+    if morph_bytes > max_storage {
+      bail!(
+        "uniform spacetime seed morph weights need {morph_bytes} bytes, but this GPU supports only {max_storage} bytes per storage binding"
+      )
+    }
+    let seed_bytes = (seed_count as u64)
+      .checked_mul(std::mem::size_of::<u32>() as u64)
+      .ok_or_else(|| anyhow!("spacetime seed output size overflow"))?;
+    if seed_bytes > max_storage {
+      bail!(
+        "uniform spacetime seed output needs {seed_bytes} bytes, but this GPU supports only {max_storage} bytes per storage binding"
+      )
+    }
+    let pair_bytes = (vertex_count_u32 as u64)
+      .checked_mul(std::mem::size_of::<[f32; 4]>() as u64)
+      .ok_or_else(|| anyhow!("spacetime seed pair scratch size overflow"))?;
+    let candidate_nearest_bytes = position_count
+      .checked_mul(std::mem::size_of::<f32>() as u64)
+      .ok_or_else(|| anyhow!("spacetime seed nearest-distance scratch size overflow"))?;
+    let candidate_score_bytes = (vertex_count_u32 as u64)
+      .checked_mul(std::mem::size_of::<f32>() as u64)
+      .ok_or_else(|| anyhow!("spacetime seed score scratch size overflow"))?;
+    for (label, bytes) in [
+      ("pair scratch", pair_bytes),
+      ("nearest-distance scratch", candidate_nearest_bytes),
+      ("candidate score scratch", candidate_score_bytes),
+    ] {
+      if bytes > max_storage {
+        bail!(
+          "uniform spacetime seed {label} needs {bytes} bytes, but this GPU supports only {max_storage} bytes per storage binding"
+        )
+      }
+    }
+    let selection_pass_count = if seed_count <= 2 {
+      seed_count as u64
+    } else {
+      2 * seed_count as u64 - 2
+    };
+    if selection_pass_count > MAX_SPACETIME_SELECTION_PASSES {
+      bail!(
+        "uniform spacetime selection needs {selection_pass_count} dependent GPU passes, but the safety limit is {MAX_SPACETIME_SELECTION_PASSES}; lower the seed count"
+      )
+    }
+    // All selector passes reuse one tiny uniform buffer. They are submitted
+    // separately because every pass depends on the previous pass's result;
+    // queue ordering makes each write visible to exactly the following pass.
+    let selection_params_bytes = std::mem::size_of::<SpacetimeSeedSelectionParams>() as u64;
+    let temporary_bytes = position_bytes
+      .checked_add(palette_bytes)
+      .and_then(|bytes| bytes.checked_add(morph_bytes))
+      .and_then(|bytes| bytes.checked_add(seed_bytes))
+      .and_then(|bytes| bytes.checked_add(pair_bytes.max(16)))
+      .and_then(|bytes| bytes.checked_add(candidate_nearest_bytes.max(4)))
+      .and_then(|bytes| bytes.checked_add(candidate_score_bytes.max(4)))
+      .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SpacetimeSeedTraceParams>() as u64))
+      .and_then(|bytes| bytes.checked_add(selection_params_bytes))
+      .ok_or_else(|| anyhow!("spacetime seed temporary memory size overflow"))?;
+    let previous_motion_bytes = self
+      .motion_lines
+      .as_ref()
+      .map(MotionLineGpuState::gpu_buffer_bytes)
+      .unwrap_or(0);
+    if previous_motion_bytes
+      .checked_add(temporary_bytes)
+      .is_none_or(|bytes| bytes > MAX_MOTION_LINE_PEAK_BYTES)
+    {
+      bail!(
+        "uniform spacetime seed extraction needs {temporary_bytes} temporary bytes while the previous bundle uses {previous_motion_bytes}; the peak budget is {MAX_MOTION_LINE_PEAK_BYTES} bytes"
+      )
+    }
+
+    let animated = self
+      .animated
+      .as_ref()
+      .ok_or_else(|| anyhow!("animated GPU geometry is not ready"))?;
+    let positions_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+      label:              Some("temporary spacetime seed positions"),
+      size:               position_bytes.max(16),
+      usage:              wgpu::BufferUsages::STORAGE,
+      mapped_at_creation: false,
+    });
+    let palettes_buffer = self
+      .device
+      .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label:    Some("temporary spacetime seed palettes"),
+        contents: bytemuck::cast_slice(&pose.palettes),
+        usage:    wgpu::BufferUsages::STORAGE,
+      });
+    let morph_weights_buffer = self
+      .device
+      .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label:    Some("temporary spacetime seed morph weights"),
+        contents: bytemuck::cast_slice(&pose.morph_weights),
+        usage:    wgpu::BufferUsages::STORAGE,
+      });
+    let trace_params = SpacetimeSeedTraceParams {
+      vertex_count:        vertex_count_u32,
+      sample_count:        pose.sample_count,
+      vertex_word_stride:  (std::mem::size_of::<SkinnedVertex>() / 4) as u32,
+      palette_stride:      pose.palette_stride,
+      morph_weight_stride: pose.morph_stride,
+      samples_per_second:  sampling_rate,
+      duration:            pose.duration,
+      _padding:            [0; 1],
+    };
+    let trace_params_buffer = self
+      .device
+      .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label:    Some("spacetime seed trace parameters"),
+        contents: bytemuck::bytes_of(&trace_params),
+        usage:    wgpu::BufferUsages::UNIFORM,
+      });
+    let seeds_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+      label:              Some("spacetime selected motion-line seeds"),
+      size:               seed_bytes.max(4),
+      usage:              wgpu::BufferUsages::STORAGE,
+      mapped_at_creation: false,
+    });
+    let pair_scores_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+      label:              Some("spacetime seed pair scores"),
+      size:               pair_bytes.max(16),
+      usage:              wgpu::BufferUsages::STORAGE,
+      mapped_at_creation: false,
+    });
+    let candidate_nearest_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+      label:              Some("spacetime seed candidate nearest distances"),
+      size:               candidate_nearest_bytes.max(4),
+      usage:              wgpu::BufferUsages::STORAGE,
+      mapped_at_creation: false,
+    });
+    let candidate_scores_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+      label:              Some("spacetime seed candidate scores"),
+      size:               candidate_score_bytes.max(4),
+      usage:              wgpu::BufferUsages::STORAGE,
+      mapped_at_creation: false,
+    });
+    let trace_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label:   Some("spacetime seed trace bind"),
+      layout:  &self.motion_seed_trace_layout,
+      entries: &[
+        wgpu::BindGroupEntry {
+          binding:  0,
+          resource: animated.vertex.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  1,
+          resource: palettes_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  2,
+          resource: animated._morph_positions.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  3,
+          resource: morph_weights_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  4,
+          resource: positions_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  5,
+          resource: trace_params_buffer.as_entire_binding(),
+        },
+      ],
+    });
+    let selection_workgroups = (vertex_count_u32 + 63) / 64;
+    let selection_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+      label:              Some("spacetime seed selection parameters"),
+      size:               selection_params_bytes,
+      usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+    let selection_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label:   Some("spacetime seed selection bind"),
+      layout:  &self.motion_seed_selection_layout,
+      entries: &[
+        wgpu::BindGroupEntry {
+          binding:  0,
+          resource: positions_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  1,
+          resource: pair_scores_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  2,
+          resource: candidate_nearest_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  3,
+          resource: candidate_scores_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  4,
+          resource: seeds_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding:  5,
+          resource: selection_params_buffer.as_entire_binding(),
+        },
+      ],
+    });
+    let mut selection_passes = Vec::with_capacity(selection_pass_count as usize);
+    let mut add_selection_pass = |stage: u32, selected_count: u32, workgroups: u32| {
+      selection_passes.push((stage, selected_count, workgroups));
+    };
+    if seed_count > 1 {
+      add_selection_pass(0, 0, selection_workgroups);
+    }
+    // This pass also handles the one-seed degenerate case.
+    add_selection_pass(1, 0, 1);
+    if seed_count > 2 {
+      add_selection_pass(2, 2, selection_workgroups);
+      for selected_count in 2..seed_count {
+        add_selection_pass(3, selected_count, 1);
+        if selected_count + 1 < seed_count {
+          add_selection_pass(4, selected_count, selection_workgroups);
+        }
+      }
+    }
+    drop(add_selection_pass);
+    let mut encoder = self
+      .device
+      .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("spacetime seed trace"),
+      });
+    {
+      let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label:            Some("spacetime seed trace pass"),
+        timestamp_writes: None,
+      });
+      pass.set_pipeline(&self.motion_seed_trace_pipeline);
+      pass.set_bind_group(0, &trace_bind, &[]);
+      pass.dispatch_workgroups((vertex_count_u32 + 7) / 8, (pose.sample_count + 7) / 8, 1);
+    }
+    self.queue.submit(Some(encoder.finish()));
+
+    for (stage, selected_count, workgroups) in selection_passes {
+      let selection_params = SpacetimeSeedSelectionParams {
+        vertex_count: vertex_count_u32,
+        sample_count: pose.sample_count,
+        seed_count,
+        stage,
+        selected_count,
+        _padding: [0; 3],
+      };
+      self.queue.write_buffer(
+        &selection_params_buffer,
+        0,
+        bytemuck::bytes_of(&selection_params),
+      );
+      let mut encoder = self
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+          label: Some("spacetime seed selection"),
+        });
+      let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label:            Some("spacetime seed selection pass"),
+        timestamp_writes: None,
+      });
+      pass.set_pipeline(&self.motion_seed_selection_pipeline);
+      pass.set_bind_group(0, &selection_bind, &[]);
+      pass.dispatch_workgroups(workgroups, 1, 1);
+      drop(pass);
+      self.queue.submit(Some(encoder.finish()));
+    }
+
+    drop(trace_bind);
+    drop(selection_bind);
+    selection_params_buffer.destroy();
+    positions_buffer.destroy();
+    palettes_buffer.destroy();
+    morph_weights_buffer.destroy();
+    trace_params_buffer.destroy();
+    pair_scores_buffer.destroy();
+    candidate_nearest_buffer.destroy();
+    candidate_scores_buffer.destroy();
+    Ok(seeds_buffer)
+  }
+
   /// Prepares the sample-major palette stream, traces every selected
   /// seed/sample pair, and then adaptively resamples each trajectory. Both
   /// compute passes stay on the GPU; only the compact setup streams cross the
@@ -1339,30 +1768,101 @@ impl Viewer {
     let animation = self
       .animation_index
       .ok_or_else(|| anyhow!("select an animation before configuring motion lines"))?;
-    let scene = self
-      .scene
-      .as_ref()
-      .ok_or_else(|| anyhow!("motion lines require an animated scene"))?;
-    let animated = self
+    let (vertex_count, palette_stride, morph_stride) = self
       .animated
       .as_ref()
-      .ok_or_else(|| anyhow!("animated GPU geometry is not ready"))?;
-    if self.mesh.vertices.len() != animated.vertex_count {
+      .ok_or_else(|| anyhow!("animated GPU geometry is not ready"))
+      .map(|animated| {
+        (
+          animated.vertex_count,
+          animated.transforms.len(),
+          animated.morph_weights_cpu.len(),
+        )
+      })?;
+    if self.mesh.vertices.len() != vertex_count {
       bail!("motion-line source and animated vertex counts differ")
     }
-    // The initial sampled mesh has the same vertex order as the immutable
-    // animated GPU mesh. Borrowing its positions lets the uniform selector
-    // perform spatial sampling without creating a second CPU position array.
-    let source_positions = &self.mesh.vertices;
-    let samples = prepare_samples(
-      scene,
-      animation,
-      animated.vertex_count,
-      |index| source_positions[index].position,
-      animated.transforms.len(),
-      animated.morph_weights_cpu.len(),
-      &config,
-    )?;
+    let (samples, spacetime_seed_buffer) = match &config.seed_selection {
+      SeedSelectionAlgorithm::UniformSpacetimeVertices {
+        count,
+        sampling_rate,
+      } => {
+        let seed_count = (*count).min(vertex_count);
+        let low_rate_pose = {
+          let scene = self
+            .scene
+            .as_ref()
+            .ok_or_else(|| anyhow!("motion lines require an animated scene"))?;
+          prepare_pose_samples(
+            scene,
+            animation,
+            palette_stride,
+            morph_stride,
+            *sampling_rate,
+          )?
+        };
+        let seed_buffer = self.trace_spacetime_seed_selection(
+          &low_rate_pose,
+          vertex_count,
+          seed_count as u32,
+          *sampling_rate,
+        )?;
+        // The low-rate CPU pose vectors are no longer needed once the GPU
+        // selector has been submitted. Do not retain them alongside the
+        // higher-rate final motion-line pose stream.
+        drop(low_rate_pose);
+        let final_pose = {
+          let scene = self
+            .scene
+            .as_ref()
+            .ok_or_else(|| anyhow!("motion lines require an animated scene"))?;
+          prepare_pose_samples(
+            scene,
+            animation,
+            palette_stride,
+            morph_stride,
+            config.frames_per_second,
+          )?
+        };
+        (
+          crate::motion_lines::MotionLineSamples {
+            // The GPU-selected seed buffer is used below. This compact CPU
+            // placeholder carries only the count through existing sizing
+            // logic and is never uploaded.
+            seeds:          vec![0; seed_count],
+            palettes:       final_pose.palettes,
+            morph_weights:  final_pose.morph_weights,
+            duration:       final_pose.duration,
+            sample_count:   final_pose.sample_count,
+            palette_stride: final_pose.palette_stride,
+            morph_stride:   final_pose.morph_stride,
+          },
+          Some(seed_buffer),
+        )
+      }
+      _ => {
+        // The initial sampled mesh has the same vertex order as the immutable
+        // animated GPU mesh. Borrowing its positions lets static uniform
+        // selection inspect the surface without another position array.
+        let scene = self
+          .scene
+          .as_ref()
+          .ok_or_else(|| anyhow!("motion lines require an animated scene"))?;
+        let source_positions = &self.mesh.vertices;
+        (
+          prepare_samples(
+            scene,
+            animation,
+            vertex_count,
+            |index| source_positions[index].position,
+            palette_stride,
+            morph_stride,
+            &config,
+          )?,
+          None,
+        )
+      }
+    };
     let seed_count = u32::try_from(samples.seeds.len())
       .map_err(|_| anyhow!("motion-line seed count exceeds the GPU addressable range"))?;
     let max_storage = self.device.limits().max_storage_buffer_binding_size as u64;
@@ -1496,13 +1996,15 @@ impl Viewer {
     // Keep the old bundle alive until the replacement has been fully created.
     // If validation or allocation fails, the previous visible bundle remains
     // usable instead of leaving the viewer in a half-configured state.
-    let seeds_buffer = self
-      .device
-      .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label:    Some("motion-line seeds"),
-        contents: bytemuck::cast_slice(&samples.seeds),
-        usage:    wgpu::BufferUsages::STORAGE,
-      });
+    let seeds_buffer = spacetime_seed_buffer.unwrap_or_else(|| {
+      self
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+          label:    Some("motion-line seeds"),
+          contents: bytemuck::cast_slice(&samples.seeds),
+          usage:    wgpu::BufferUsages::STORAGE,
+        })
+    });
     let palettes_buffer = self
       .device
       .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1562,6 +2064,10 @@ impl Viewer {
         contents: bytemuck::bytes_of(&style),
         usage:    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
       });
+    let animated = self
+      .animated
+      .as_ref()
+      .ok_or_else(|| anyhow!("animated GPU geometry is not ready"))?;
     let trace_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
       label:   Some("motion-line compute bind"),
       layout:  &self.motion_trace_layout,

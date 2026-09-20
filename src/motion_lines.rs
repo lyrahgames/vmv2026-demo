@@ -15,7 +15,7 @@ use crate::common::Vec3;
 /// Every selector returns indices into the immutable animated vertex buffer.
 /// Consequently a seed is always an actual surface vertex, never an
 /// interpolated point or an independently invented sample.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SeedSelectionAlgorithm {
   /// Use every vertex in every loaded surface primitive.
   AllVertices,
@@ -27,6 +27,13 @@ pub enum SeedSelectionAlgorithm {
   /// seeds form the farthest pair; later seeds maximize their distance to the
   /// closest already selected seed.
   UniformVertices { count: usize },
+  /// Select vertices by applying the same greedy max-min procedure to the
+  /// complete animation sampled at a lower rate. The positions are generated
+  /// and consumed on the GPU before the final high-rate trace is launched.
+  UniformSpacetimeVertices {
+    count:         usize,
+    sampling_rate: f32,
+  },
 }
 
 impl SeedSelectionAlgorithm {
@@ -60,7 +67,7 @@ impl SeedSelectionAlgorithm {
       }
       // Spatial selection must go through `select_positions`; returning a
       // prefix here would violate the uniform-covering contract silently.
-      Self::UniformVertices { .. } => Vec::new(),
+      Self::UniformVertices { .. } | Self::UniformSpacetimeVertices { .. } => Vec::new(),
     }
   }
 
@@ -72,7 +79,9 @@ impl SeedSelectionAlgorithm {
     F: Fn(usize) -> [f32; 3], {
     match self {
       Self::UniformVertices { count } => select_uniform_vertices(vertex_count, *count, position_at),
-      Self::AllVertices | Self::RandomVertices { .. } => self.select(vertex_count),
+      Self::AllVertices | Self::RandomVertices { .. } | Self::UniformSpacetimeVertices { .. } => {
+        self.select(vertex_count)
+      }
     }
   }
 }
@@ -221,10 +230,20 @@ impl MotionLineConfig {
       crate::common::bail!("motion-line FPS must be finite and greater than zero")
     }
     if let SeedSelectionAlgorithm::RandomVertices { count }
-    | SeedSelectionAlgorithm::UniformVertices { count } = self.seed_selection
+    | SeedSelectionAlgorithm::UniformVertices { count }
+    | SeedSelectionAlgorithm::UniformSpacetimeVertices { count, .. } = self.seed_selection
     {
       if count == 0 {
         crate::common::bail!("motion-line seed count must be greater than zero")
+      }
+    }
+    if let SeedSelectionAlgorithm::UniformSpacetimeVertices { sampling_rate, .. } =
+      self.seed_selection
+    {
+      if !sampling_rate.is_finite() || sampling_rate <= 0.0 {
+        crate::common::bail!(
+          "uniform spacetime seed sampling rate must be finite and greater than zero"
+        )
       }
     }
     Ok(())
@@ -247,31 +266,41 @@ pub(crate) struct MotionLineSamples {
   pub morph_stride:   u32,
 }
 
-/// Builds the sample data for one selected animation.
-pub(crate) fn prepare_samples(
+/// Animation pose streams prepared for one uniform temporal sampling rate.
+/// The spacetime selector uses this type for its short-lived low-rate pass;
+/// the ordinary motion-line extraction uses it again at the requested final
+/// line FPS.
+pub(crate) struct PoseSamples {
+  pub palettes:       Vec<crate::mesh::SkinTransform>,
+  pub morph_weights:  Vec<f32>,
+  pub duration:       f32,
+  pub sample_count:   u32,
+  pub palette_stride: u32,
+  pub morph_stride:   u32,
+}
+
+/// Prepares only the sample-major pose data. Keeping this separate from seed
+/// selection lets the spacetime algorithm reuse the same GPU skinning inputs
+/// while keeping its temporary position output much smaller than full
+/// trajectory records.
+pub(crate) fn prepare_pose_samples(
   scene: &crate::scene::AnimatedScene,
   animation: usize,
-  vertex_count: usize,
-  position_at: impl Fn(usize) -> [f32; 3],
   palette_stride: usize,
   morph_stride: usize,
-  config: &MotionLineConfig,
-) -> crate::common::Result<MotionLineSamples> {
-  config.validate()?;
+  frames_per_second: f32,
+) -> crate::common::Result<PoseSamples> {
+  if !frames_per_second.is_finite() || frames_per_second <= 0.0 {
+    crate::common::bail!("motion-line FPS must be finite and greater than zero")
+  }
   let info =
     scene.animations().get(animation).cloned().ok_or_else(|| {
       crate::common::anyhow!("motion-line animation index {animation} is invalid")
     })?;
-  let seeds = config
-    .seed_selection
-    .select_positions(vertex_count, position_at);
-  if seeds.is_empty() {
-    crate::common::bail!("motion-line seed selection produced no vertices")
-  }
 
   // Include both endpoints. Clamping the final time avoids wrapping back to
   // the first key when duration * FPS is not an integer.
-  let sample_count = ((info.duration.max(0.0) * config.frames_per_second).ceil() as usize)
+  let sample_count = ((info.duration.max(0.0) * frames_per_second).ceil() as usize)
     .saturating_add(1)
     .max(1);
   let morph_stride = morph_stride.max(1);
@@ -283,7 +312,7 @@ pub(crate) fn prepare_samples(
     let time = if sample + 1 == sample_count {
       info.duration.max(0.0)
     } else {
-      sample as f32 / config.frames_per_second
+      sample as f32 / frames_per_second
     };
     scene.update_gpu_pose(
       Some(animation),
@@ -301,14 +330,58 @@ pub(crate) fn prepare_samples(
     morph_weights.extend_from_slice(&frame_morph_weights[..morph_stride]);
   }
 
-  Ok(MotionLineSamples {
-    seeds,
+  Ok(PoseSamples {
     palettes,
     morph_weights,
     duration: info.duration.max(0.0),
     sample_count: sample_count as u32,
     palette_stride: palette_stride as u32,
     morph_stride: morph_stride as u32,
+  })
+}
+
+/// Builds the sample data for one selected animation.
+pub(crate) fn prepare_samples(
+  scene: &crate::scene::AnimatedScene,
+  animation: usize,
+  vertex_count: usize,
+  position_at: impl Fn(usize) -> [f32; 3],
+  palette_stride: usize,
+  morph_stride: usize,
+  config: &MotionLineConfig,
+) -> crate::common::Result<MotionLineSamples> {
+  config.validate()?;
+  if matches!(
+    config.seed_selection,
+    SeedSelectionAlgorithm::UniformSpacetimeVertices { .. }
+  ) {
+    crate::common::bail!(
+      "uniform spacetime seeds must be prepared by the GPU motion-line extraction stage"
+    )
+  }
+  let seeds = config
+    .seed_selection
+    .select_positions(vertex_count, position_at);
+  if seeds.is_empty() {
+    crate::common::bail!("motion-line seed selection produced no vertices")
+  }
+
+  let pose = prepare_pose_samples(
+    scene,
+    animation,
+    palette_stride,
+    morph_stride,
+    config.frames_per_second,
+  )?;
+
+  Ok(MotionLineSamples {
+    seeds,
+    palettes: pose.palettes,
+    morph_weights: pose.morph_weights,
+    duration: pose.duration,
+    sample_count: pose.sample_count,
+    palette_stride: pose.palette_stride,
+    morph_stride: pose.morph_stride,
   })
 }
 

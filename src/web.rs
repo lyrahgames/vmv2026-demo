@@ -279,6 +279,26 @@ impl ViewerHandle {
       .await
   }
 
+  /// Selects seeds uniformly over a low-rate sample of the complete
+  /// animation, then traces the selected seeds at the final line FPS.
+  #[wasm_bindgen(js_name = setMotionLinesUniformSpacetime)]
+  pub async fn set_motion_lines_uniform_spacetime(
+    &self,
+    count: usize,
+    sampling_rate: f32,
+    fps: f32,
+  ) -> Result<(), JsValue> {
+    self
+      .set_motion_lines(MotionLineConfig {
+        seed_selection:    SeedSelectionAlgorithm::UniformSpacetimeVertices {
+          count,
+          sampling_rate,
+        },
+        frames_per_second: fps,
+      })
+      .await
+  }
+
   async fn set_motion_lines(&self, config: MotionLineConfig) -> Result<(), JsValue> {
     let Some(queue) = self.queue() else {
       return Err(JsValue::from_str("viewer runtime has stopped"));

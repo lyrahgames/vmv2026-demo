@@ -263,6 +263,27 @@ pub fn tasks(path: &str) -> Result<TaskQueue> {
     .set("set_motion_lines_uniform", set_motion_lines_uniform)
     .map_err(|e| anyhow!(e.to_string()))?;
 
+  let spacetime_motion_lines = queue.clone();
+  let set_motion_lines_uniform_spacetime = lua
+    .create_function(move |_, (count, sampling_rate, fps): (usize, f32, f32)| {
+      spacetime_motion_lines.configure_motion_lines(MotionLineConfig {
+        seed_selection:    SeedSelectionAlgorithm::UniformSpacetimeVertices {
+          count,
+          sampling_rate,
+        },
+        frames_per_second: fps,
+      });
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set(
+      "set_motion_lines_uniform_spacetime",
+      set_motion_lines_uniform_spacetime,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
+
   let clear_motion_lines = queue.clone();
   let clear_motion_lines_function = lua
     .create_function(move |_, ()| {
