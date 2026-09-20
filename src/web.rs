@@ -266,6 +266,19 @@ impl ViewerHandle {
       .await
   }
 
+  /// Extracts trajectories from a spatially uniform greedy vertex set. The
+  /// selector starts at the farthest pair and repeatedly adds the candidate
+  /// farthest from its closest existing seed.
+  #[wasm_bindgen(js_name = setMotionLinesUniform)]
+  pub async fn set_motion_lines_uniform(&self, count: usize, fps: f32) -> Result<(), JsValue> {
+    self
+      .set_motion_lines(MotionLineConfig {
+        seed_selection:    SeedSelectionAlgorithm::UniformVertices { count },
+        frames_per_second: fps,
+      })
+      .await
+  }
+
   async fn set_motion_lines(&self, config: MotionLineConfig) -> Result<(), JsValue> {
     let Some(queue) = self.queue() else {
       return Err(JsValue::from_str("viewer runtime has stopped"));

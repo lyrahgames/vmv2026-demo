@@ -1347,10 +1347,18 @@ impl Viewer {
       .animated
       .as_ref()
       .ok_or_else(|| anyhow!("animated GPU geometry is not ready"))?;
+    if self.mesh.vertices.len() != animated.vertex_count {
+      bail!("motion-line source and animated vertex counts differ")
+    }
+    // The initial sampled mesh has the same vertex order as the immutable
+    // animated GPU mesh. Borrowing its positions lets the uniform selector
+    // perform spatial sampling without creating a second CPU position array.
+    let source_positions = &self.mesh.vertices;
     let samples = prepare_samples(
       scene,
       animation,
       animated.vertex_count,
+      |index| source_positions[index].position,
       animated.transforms.len(),
       animated.morph_weights_cpu.len(),
       &config,

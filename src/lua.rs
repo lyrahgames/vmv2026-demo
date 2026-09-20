@@ -248,6 +248,21 @@ pub fn tasks(path: &str) -> Result<TaskQueue> {
     .set("set_motion_lines_random", set_motion_lines_random)
     .map_err(|e| anyhow!(e.to_string()))?;
 
+  let uniform_motion_lines = queue.clone();
+  let set_motion_lines_uniform = lua
+    .create_function(move |_, (count, fps): (usize, f32)| {
+      uniform_motion_lines.configure_motion_lines(MotionLineConfig {
+        seed_selection:    SeedSelectionAlgorithm::UniformVertices { count },
+        frames_per_second: fps,
+      });
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("set_motion_lines_uniform", set_motion_lines_uniform)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
   let clear_motion_lines = queue.clone();
   let clear_motion_lines_function = lua
     .create_function(move |_, ()| {

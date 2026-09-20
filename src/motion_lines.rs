@@ -8,6 +8,8 @@
 //! applies those palettes to the selected source vertices and writes the full
 //! trajectory buffer on the GPU.
 
+use crate::common::Vec3;
+
 /// The first extension point for seed selection algorithms.
 ///
 /// Every selector returns indices into the immutable animated vertex buffer.
@@ -21,10 +23,15 @@ pub enum SeedSelectionAlgorithm {
   /// pseudo-random selector. Determinism keeps native and browser showcases
   /// reproducible while still providing a random vertex subset.
   RandomVertices { count: usize },
+  /// Select vertices with greedy farthest-point sampling. The first two
+  /// seeds form the farthest pair; later seeds maximize their distance to the
+  /// closest already selected seed.
+  UniformVertices { count: usize },
 }
 
 impl SeedSelectionAlgorithm {
-  /// Selects valid source-vertex indices for one animated GPU mesh.
+  /// Selects valid source-vertex indices for algorithms that do not need
+  /// candidate positions.
   pub fn select(&self, vertex_count: usize) -> Vec<u32> {
     match self {
       Self::AllVertices => (0..vertex_count as u32).collect(),
@@ -51,8 +58,151 @@ impl SeedSelectionAlgorithm {
         candidates.truncate(target);
         candidates
       }
+      // Spatial selection must go through `select_positions`; returning a
+      // prefix here would violate the uniform-covering contract silently.
+      Self::UniformVertices { .. } => Vec::new(),
     }
   }
+
+  /// Selects source vertices while allowing spatial algorithms to inspect
+  /// positions without copying the animated GPU vertex stream. The callback
+  /// is evaluated only during this method and is never retained.
+  pub fn select_positions<F>(&self, vertex_count: usize, position_at: F) -> Vec<u32>
+  where
+    F: Fn(usize) -> [f32; 3], {
+    match self {
+      Self::UniformVertices { count } => select_uniform_vertices(vertex_count, *count, position_at),
+      Self::AllVertices | Self::RandomVertices { .. } => self.select(vertex_count),
+    }
+  }
+}
+
+/// Small deterministic pseudo-random generator used only for tie-breaking.
+/// Determinism makes native and browser showcases reproducible, while the
+/// reservoir choice still follows the algorithm's random tie rule.
+fn next_selection_random(state: &mut u64) -> u64 {
+  *state ^= *state << 13;
+  *state ^= *state >> 7;
+  *state ^= *state << 17;
+  *state
+}
+
+/// Replaces a current best candidate with probability 1/`ties`.
+fn replace_random_tie(state: &mut u64, ties: &mut u64) -> bool {
+  *ties = ties.saturating_add(1);
+  next_selection_random(state) % *ties == 0
+}
+
+/// Greedy max-min/farthest-point vertex sampling from the requested formula.
+fn select_uniform_vertices<F>(vertex_count: usize, requested: usize, position_at: F) -> Vec<u32>
+where
+  F: Fn(usize) -> [f32; 3], {
+  let target = requested.min(vertex_count);
+  if target == 0 || vertex_count == 0 {
+    return Vec::new();
+  }
+
+  // Cache positions only for this CPU selection stage. The temporary vector
+  // is released before GPU extraction begins and is never uploaded as a
+  // second vertex buffer.
+  let positions: Vec<Vec3> = (0..vertex_count)
+    .map(|index| Vec3::from_array(position_at(index)))
+    .collect();
+  let mut random_state = 0x9E37_79B9_u64 ^ vertex_count as u64 ^ target as u64;
+
+  // A single requested seed has no pair to initialize. Pick it randomly,
+  // which is the natural degenerate form of the random tie rule.
+  if target == 1 {
+    return vec![(next_selection_random(&mut random_state) as usize % vertex_count) as u32];
+  }
+
+  // Find the farthest pair. Reservoir sampling makes exact distance ties
+  // random without storing the O(n²) pairwise distance matrix.
+  let mut first = 0usize;
+  let mut second = 1usize;
+  let mut best_distance = f32::NEG_INFINITY;
+  let mut ties = 0_u64;
+  for left in 0..vertex_count {
+    for right in (left + 1)..vertex_count {
+      let distance = positions[left].distance_squared(positions[right]);
+      if !distance.is_finite() {
+        continue;
+      }
+      if distance > best_distance {
+        best_distance = distance;
+        first = left;
+        second = right;
+        ties = 1;
+      } else if distance == best_distance && replace_random_tie(&mut random_state, &mut ties) {
+        first = left;
+        second = right;
+      }
+    }
+  }
+  // Keep a valid result for malformed source data with no finite pair.
+  if !best_distance.is_finite() {
+    first = 0;
+    second = 1;
+  }
+
+  let mut selected = vec![false; vertex_count];
+  selected[first] = true;
+  selected[second] = true;
+  let mut seeds = vec![first as u32, second as u32];
+
+  // `nearest_squared[i]` is the distance from candidate i to its closest
+  // selected seed. Updating it after each promotion is equivalent to
+  // recomputing δ(j) at every iteration, but uses O(n) memory and O(n*k)
+  // work instead of storing the full pairwise distance matrix.
+  let mut nearest_squared = vec![f32::INFINITY; vertex_count];
+  for candidate in 0..vertex_count {
+    if !selected[candidate] {
+      nearest_squared[candidate] = positions[candidate]
+        .distance_squared(positions[first])
+        .min(positions[candidate].distance_squared(positions[second]));
+    }
+  }
+
+  while seeds.len() < target {
+    let mut next = None;
+    let mut best_nearest = f32::NEG_INFINITY;
+    let mut candidate_ties = 0_u64;
+    for candidate in 0..vertex_count {
+      if selected[candidate] {
+        continue;
+      }
+      let distance = nearest_squared[candidate];
+      if distance > best_nearest {
+        best_nearest = distance;
+        next = Some(candidate);
+        candidate_ties = 1;
+      } else if distance == best_nearest
+        && replace_random_tie(&mut random_state, &mut candidate_ties)
+      {
+        next = Some(candidate);
+      }
+    }
+
+    // Non-finite positions are still valid source vertices. If they cannot
+    // participate in a distance comparison, promote the first remaining one
+    // so the requested count is honored rather than panicking.
+    let candidate = next.unwrap_or_else(|| {
+      (0..vertex_count)
+        .find(|&index| !selected[index])
+        .expect("an unselected candidate exists before reaching target")
+    });
+    selected[candidate] = true;
+    seeds.push(candidate as u32);
+
+    for other in 0..vertex_count {
+      if !selected[other] {
+        nearest_squared[other] =
+          nearest_squared[other].min(positions[other].distance_squared(positions[candidate]));
+      }
+    }
+  }
+
+  seeds
 }
 
 /// Configuration for extracting one complete speedline bundle.
@@ -70,9 +220,11 @@ impl MotionLineConfig {
     if !self.frames_per_second.is_finite() || self.frames_per_second <= 0.0 {
       crate::common::bail!("motion-line FPS must be finite and greater than zero")
     }
-    if let SeedSelectionAlgorithm::RandomVertices { count } = self.seed_selection {
+    if let SeedSelectionAlgorithm::RandomVertices { count }
+    | SeedSelectionAlgorithm::UniformVertices { count } = self.seed_selection
+    {
       if count == 0 {
-        crate::common::bail!("random motion-line seed count must be greater than zero")
+        crate::common::bail!("motion-line seed count must be greater than zero")
       }
     }
     Ok(())
@@ -100,6 +252,7 @@ pub(crate) fn prepare_samples(
   scene: &crate::scene::AnimatedScene,
   animation: usize,
   vertex_count: usize,
+  position_at: impl Fn(usize) -> [f32; 3],
   palette_stride: usize,
   morph_stride: usize,
   config: &MotionLineConfig,
@@ -109,7 +262,9 @@ pub(crate) fn prepare_samples(
     scene.animations().get(animation).cloned().ok_or_else(|| {
       crate::common::anyhow!("motion-line animation index {animation} is invalid")
     })?;
-  let seeds = config.seed_selection.select(vertex_count);
+  let seeds = config
+    .seed_selection
+    .select_positions(vertex_count, position_at);
   if seeds.is_empty() {
     crate::common::bail!("motion-line seed selection produced no vertices")
   }
@@ -159,7 +314,7 @@ pub(crate) fn prepare_samples(
 
 #[cfg(test)]
 mod tests {
-  use super::SeedSelectionAlgorithm;
+  use super::{SeedSelectionAlgorithm, Vec3};
 
   #[test]
   fn all_vertices_are_valid_source_indices() {
@@ -178,5 +333,49 @@ mod tests {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), seeds.len());
+  }
+
+  #[test]
+  fn uniform_selection_starts_with_a_farthest_pair() {
+    let positions = [
+      [0.0, 0.0, 0.0],
+      [2.0, 0.0, 0.0],
+      [0.0, 1.0, 0.0],
+      [2.0, 1.0, 0.0],
+    ];
+    let seeds = SeedSelectionAlgorithm::UniformVertices { count: 3 }
+      .select_positions(positions.len(), |index| positions[index]);
+    assert_eq!(seeds.len(), 3);
+    let first = positions[seeds[0] as usize];
+    let second = positions[seeds[1] as usize];
+    assert_eq!(
+      Vec3::from_array(first).distance_squared(Vec3::from_array(second)),
+      5.0
+    );
+  }
+
+  #[test]
+  fn uniform_selection_promotes_the_maximin_candidate() {
+    let positions = [
+      [0.0, 0.0, 0.0],
+      [1.0, 0.0, 0.0],
+      [5.0, 0.0, 0.0],
+      [9.0, 0.0, 0.0],
+      [10.0, 0.0, 0.0],
+    ];
+    let seeds = SeedSelectionAlgorithm::UniformVertices { count: 3 }
+      .select_positions(positions.len(), |index| positions[index]);
+    assert_eq!(seeds[2], 2);
+  }
+
+  #[test]
+  fn uniform_selection_handles_one_vertex_and_clamps_count() {
+    let positions = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+    let one = SeedSelectionAlgorithm::UniformVertices { count: 1 }
+      .select_positions(positions.len(), |index| positions[index]);
+    let all = SeedSelectionAlgorithm::UniformVertices { count: 20 }
+      .select_positions(positions.len(), |index| positions[index]);
+    assert_eq!(one.len(), 1);
+    assert_eq!(all.len(), positions.len());
   }
 }
