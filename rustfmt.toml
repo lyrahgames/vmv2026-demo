@@ -1,0 +1,6 @@
+edition = "2024"
+brace_style = "PreferSameLine"
+fn_single_line = true
+enum_discrim_align_threshold = 20
+struct_field_align_threshold = 20
+tab_spaces = 2

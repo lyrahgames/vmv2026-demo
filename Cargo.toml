@@ -1,0 +1,42 @@
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.wasm-pack.profile.release]
+# Run Binaryen's release optimizer after Cargo has produced optimized WASM.
+# `-O2` is the conservative Binaryen release preset. It materially reduces
+# code size without the extra aggressive transformations of `-O4`.
+wasm-opt = ["-O2"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "demo"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"
+futures = "0.3"
+gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"] }
+oxideav-fbx = { version = "0.0.3", default-features = false }
+oxideav-mesh3d = { version = "0.0.6", default-features = false }
+tobj = "4"
+wgpu = "25"
+winit = "0.30"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+pollster = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Performance", "Window"] }
+

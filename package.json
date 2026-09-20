@@ -1,0 +1,11 @@
+{
+  "name": "demo",
+  "private": true,
+  "scripts": {
+    "check": "cargo check --manifest-path Cargo.toml --lib --target wasm32-unknown-unknown",
+    "build": "pnpm run check && wasm-pack build . --target web --out-dir ../generated/demo --out-name demo"
+  },
+  "devDependencies": {
+    "wasm-pack": "^0.15.0"
+  }
+}

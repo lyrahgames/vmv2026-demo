@@ -1,0 +1,4 @@
+# Keep the standalone demo package's wasm-pack bootstrap enabled when this
+# directory is used outside the parent Slides workspace.
+allowBuilds:
+  wasm-pack: true
