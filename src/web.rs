@@ -9,7 +9,7 @@ use crate::{
   camera::{CameraConfig, CameraFollowConfig},
   common::*,
   mesh::Mesh,
-  motion_lines::{MotionLineConfig, SeedSelectionAlgorithm},
+  motion_lines::{ImportanceSelectionMode, MotionLineConfig, SeedSelectionAlgorithm},
   scene::{AnimatedScene, AnimationInfo},
 };
 use js_sys::Uint8Array;
@@ -173,6 +173,14 @@ impl ViewerHandle {
     }
   }
 
+  /// Frames the complete selected animation once without animating the camera.
+  #[wasm_bindgen(js_name = frameAnimation)]
+  pub fn frame_animation(&self) {
+    if let Some(queue) = self.queue() {
+      queue.enqueue_web(self.id, |viewer| viewer.frame_animation());
+    }
+  }
+
   /// Sets the normalized linear-RGB clear color used by the active canvas.
   /// JavaScript passes `[red, green, blue]`; the Rust viewer clamps values so
   /// scripts can safely use ordinary normalized color constants.
@@ -293,6 +301,59 @@ impl ViewerHandle {
         seed_selection:    SeedSelectionAlgorithm::UniformSpacetimeVertices {
           count,
           sampling_rate,
+        },
+        frames_per_second: fps,
+      })
+      .await
+  }
+
+  /// Selects seeds from the normalized spacetime max-min score. When
+  /// `stochastic` is true, each round samples from that distribution;
+  /// otherwise it promotes its largest probability.
+  #[wasm_bindgen(js_name = setMotionLinesImportanceSpacetime)]
+  pub async fn set_motion_lines_importance_spacetime(
+    &self,
+    count: usize,
+    sampling_rate: f32,
+    stochastic: bool,
+    fps: f32,
+  ) -> Result<(), JsValue> {
+    self
+      .set_motion_lines(MotionLineConfig {
+        seed_selection: SeedSelectionAlgorithm::ImportanceSpacetimeVertices {
+          count,
+          sampling_rate,
+          mode: if stochastic {
+            ImportanceSelectionMode::Stochastic
+          } else {
+            ImportanceSelectionMode::Deterministic
+          },
+        },
+        frames_per_second: fps,
+      })
+      .await
+  }
+
+  /// Selects seeds using spacetime importance multiplied by normalized
+  /// travelled-distance importance.
+  #[wasm_bindgen(js_name = setMotionLinesExtendedImportanceSpacetime)]
+  pub async fn set_motion_lines_extended_importance_spacetime(
+    &self,
+    count: usize,
+    sampling_rate: f32,
+    stochastic: bool,
+    fps: f32,
+  ) -> Result<(), JsValue> {
+    self
+      .set_motion_lines(MotionLineConfig {
+        seed_selection: SeedSelectionAlgorithm::ExtendedImportanceSpacetimeVertices {
+          count,
+          sampling_rate,
+          mode: if stochastic {
+            ImportanceSelectionMode::Stochastic
+          } else {
+            ImportanceSelectionMode::Deterministic
+          },
         },
         frames_per_second: fps,
       })
@@ -439,7 +500,9 @@ impl ViewerHandle {
 }
 
 #[wasm_bindgen(start)]
-pub fn start() { console_error_panic_hook::set_once(); }
+pub fn start() {
+  console_error_panic_hook::set_once();
+}
 
 /// Converts Rust animation metadata into ordinary JavaScript objects without
 /// requiring a serialization dependency in the shared renderer crate.

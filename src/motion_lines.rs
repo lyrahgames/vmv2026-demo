@@ -10,6 +10,24 @@
 
 use crate::common::Vec3;
 
+/// Selection mode for importance-based spacetime seeding.
+///
+/// Stochastic selection uses a deterministic GPU hash as its seeded random
+/// source, keeping native and browser output reproducible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportanceSelectionMode {
+  Deterministic,
+  Stochastic,
+}
+
+/// Common options for the shared GPU spacetime selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpacetimeSelectionOptions {
+  pub importance: bool,
+  pub stochastic: bool,
+  pub extended: bool,
+}
+
 /// The first extension point for seed selection algorithms.
 ///
 /// Every selector returns indices into the immutable animated vertex buffer.
@@ -30,9 +48,20 @@ pub enum SeedSelectionAlgorithm {
   /// Select vertices by applying the same greedy max-min procedure to the
   /// complete animation sampled at a lower rate. The positions are generated
   /// and consumed on the GPU before the final high-rate trace is launched.
-  UniformSpacetimeVertices {
+  UniformSpacetimeVertices { count: usize, sampling_rate: f32 },
+  /// Select from the normalized spacetime max-min score. Deterministic mode
+  /// chooses the largest probability; stochastic mode samples from it.
+  ImportanceSpacetimeVertices {
     count:         usize,
     sampling_rate: f32,
+    mode: ImportanceSelectionMode,
+  },
+  /// Importance spacetime selection additionally weights candidates by their
+  /// travelled distance over the sampled animation.
+  ExtendedImportanceSpacetimeVertices {
+    count: usize,
+    sampling_rate: f32,
+    mode: ImportanceSelectionMode,
   },
 }
 
@@ -67,7 +96,10 @@ impl SeedSelectionAlgorithm {
       }
       // Spatial selection must go through `select_positions`; returning a
       // prefix here would violate the uniform-covering contract silently.
-      Self::UniformVertices { .. } | Self::UniformSpacetimeVertices { .. } => Vec::new(),
+      Self::UniformVertices { .. }
+      | Self::UniformSpacetimeVertices { .. }
+      | Self::ImportanceSpacetimeVertices { .. }
+      | Self::ExtendedImportanceSpacetimeVertices { .. } => Vec::new(),
     }
   }
 
@@ -76,12 +108,61 @@ impl SeedSelectionAlgorithm {
   /// is evaluated only during this method and is never retained.
   pub fn select_positions<F>(&self, vertex_count: usize, position_at: F) -> Vec<u32>
   where
-    F: Fn(usize) -> [f32; 3], {
+    F: Fn(usize) -> [f32; 3],
+  {
     match self {
       Self::UniformVertices { count } => select_uniform_vertices(vertex_count, *count, position_at),
-      Self::AllVertices | Self::RandomVertices { .. } | Self::UniformSpacetimeVertices { .. } => {
-        self.select(vertex_count)
+      Self::AllVertices
+      | Self::RandomVertices { .. }
+      | Self::UniformSpacetimeVertices { .. }
+      | Self::ImportanceSpacetimeVertices { .. }
+      | Self::ExtendedImportanceSpacetimeVertices { .. } => self.select(vertex_count),
       }
+    }
+
+  /// Returns the common GPU configuration for all spacetime strategies.
+  /// Keeping this path shared avoids duplicating tracing and score logic.
+  pub(crate) fn spacetime_options(&self) -> Option<(usize, f32, SpacetimeSelectionOptions)> {
+    match self {
+      Self::UniformSpacetimeVertices {
+        count,
+        sampling_rate,
+      } => Some((
+        *count,
+        *sampling_rate,
+        SpacetimeSelectionOptions {
+          importance: false,
+          stochastic: false,
+          extended: false,
+        },
+      )),
+      Self::ImportanceSpacetimeVertices {
+        count,
+        sampling_rate,
+        mode,
+      } => Some((
+        *count,
+        *sampling_rate,
+        SpacetimeSelectionOptions {
+          importance: true,
+          stochastic: matches!(mode, ImportanceSelectionMode::Stochastic),
+          extended: false,
+        },
+      )),
+      Self::ExtendedImportanceSpacetimeVertices {
+        count,
+        sampling_rate,
+        mode,
+      } => Some((
+        *count,
+        *sampling_rate,
+        SpacetimeSelectionOptions {
+          importance: true,
+          stochastic: matches!(mode, ImportanceSelectionMode::Stochastic),
+          extended: true,
+        },
+      )),
+      _ => None,
     }
   }
 }
@@ -105,7 +186,8 @@ fn replace_random_tie(state: &mut u64, ties: &mut u64) -> bool {
 /// Greedy max-min/farthest-point vertex sampling from the requested formula.
 fn select_uniform_vertices<F>(vertex_count: usize, requested: usize, position_at: F) -> Vec<u32>
 where
-  F: Fn(usize) -> [f32; 3], {
+  F: Fn(usize) -> [f32; 3],
+{
   let target = requested.min(vertex_count);
   if target == 0 || vertex_count == 0 {
     return Vec::new();
@@ -231,15 +313,16 @@ impl MotionLineConfig {
     }
     if let SeedSelectionAlgorithm::RandomVertices { count }
     | SeedSelectionAlgorithm::UniformVertices { count }
-    | SeedSelectionAlgorithm::UniformSpacetimeVertices { count, .. } = self.seed_selection
+    | SeedSelectionAlgorithm::UniformSpacetimeVertices { count, .. }
+    | SeedSelectionAlgorithm::ImportanceSpacetimeVertices { count, .. }
+    | SeedSelectionAlgorithm::ExtendedImportanceSpacetimeVertices { count, .. } =
+      self.seed_selection
     {
       if count == 0 {
         crate::common::bail!("motion-line seed count must be greater than zero")
       }
     }
-    if let SeedSelectionAlgorithm::UniformSpacetimeVertices { sampling_rate, .. } =
-      self.seed_selection
-    {
+    if let Some((_, sampling_rate, _)) = self.seed_selection.spacetime_options() {
       if !sampling_rate.is_finite() || sampling_rate <= 0.0 {
         crate::common::bail!(
           "uniform spacetime seed sampling rate must be finite and greater than zero"
@@ -354,10 +437,10 @@ pub(crate) fn prepare_samples(
   if matches!(
     config.seed_selection,
     SeedSelectionAlgorithm::UniformSpacetimeVertices { .. }
+      | SeedSelectionAlgorithm::ImportanceSpacetimeVertices { .. }
+      | SeedSelectionAlgorithm::ExtendedImportanceSpacetimeVertices { .. }
   ) {
-    crate::common::bail!(
-      "uniform spacetime seeds must be prepared by the GPU motion-line extraction stage"
-    )
+    crate::common::bail!("spacetime seeds must be prepared by the GPU motion-line extraction stage")
   }
   let seeds = config
     .seed_selection

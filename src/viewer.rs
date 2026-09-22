@@ -9,7 +9,7 @@ use crate::{
   common::*,
   mesh::{Mesh, SkinTransform, SkinnedVertex, Vertex},
   motion_lines::{
-    MotionLineConfig, PoseSamples, SeedSelectionAlgorithm, prepare_pose_samples, prepare_samples,
+    MotionLineConfig, PoseSamples, SpacetimeSelectionOptions, prepare_pose_samples, prepare_samples,
   },
   scene::{AnimatedGpuMesh, AnimatedScene, AnimationInfo},
 };
@@ -107,7 +107,9 @@ struct SpacetimeSeedSelectionParams {
   seed_count:     u32,
   stage:          u32,
   selected_count: u32,
-  _padding:       [u32; 3],
+  importance: u32,
+  stochastic: u32,
+  extended: u32,
 }
 
 /// Visual parameters for the screen-space speedline bundle.
@@ -1042,7 +1044,9 @@ impl Viewer {
   /// GPUDevice per slide while still releasing the old canvas attachment
   /// before its window is dropped.
   #[cfg(target_arch = "wasm32")]
-  pub fn detach_surface(&mut self) { self.surface.take(); }
+  pub fn detach_surface(&mut self) {
+    self.surface.take();
+  }
 
   /// Attaches the existing renderer to a newly visible canvas window.
   ///
@@ -1103,6 +1107,47 @@ impl Viewer {
     self.camera_follow = None;
     self.camera_target_path = None;
     self.camera.reset_for_bounds(self.mesh.min, self.mesh.max)
+  }
+
+  /// Frames the complete selected animation once and leaves the camera fixed.
+  /// The sampled centroid path and per-pose radius are reused from the
+  /// follow-camera preparation, but no follow state is installed.
+  pub fn frame_animation(&mut self) {
+    self.camera_follow = None;
+    self.ensure_camera_target_path();
+    let Some(path) = self.camera_target_path.as_ref() else {
+      self.camera.reset_for_bounds(self.mesh.min, self.mesh.max);
+      return;
+    };
+    if path.targets.is_empty() {
+      self.camera.reset_for_bounds(self.mesh.min, self.mesh.max);
+      return;
+    }
+
+    let mut min = path.targets[0];
+    let mut max = path.targets[0];
+    for &target in &path.targets[1..] {
+      min = min.min(target);
+      max = max.max(target);
+    }
+    let center = (min + max) * 0.5;
+    let radius = path
+      .targets
+      .iter()
+      .map(|&target| (target - center).length() + path.radius)
+      .fold(path.radius, f32::max);
+    // Keep the complete-clip framing while bringing the presentation view
+    // closer to the fighter for the spacetime showcase slides.
+    let extent = Vec3::splat((radius * 0.70).max(0.01));
+    // Use a canonical presentation view instead of inheriting the previous
+    // slide's camera direction or field of view.
+    let direction = Vec3::new(1.0, 0.65, 1.0).normalize();
+    self.camera.target = center;
+    self.camera.eye = center + direction;
+    self.camera.vertical_fov = 45.0;
+    self
+      .camera
+      .reset_for_bounds(center - extent, center + extent);
   }
 
   /// Replaces the current static mesh and clears any glTF playback state.
@@ -1415,11 +1460,15 @@ impl Viewer {
   }
 
   /// Pauses playback while retaining the selected frame and time.
-  pub fn pause_animation(&mut self) { self.animation_playing = false; }
+  pub fn pause_animation(&mut self) {
+    self.animation_playing = false;
+  }
 
   /// Sets playback speed. Negative values play backwards; zero pauses time
   /// progression without changing the selected playing state.
-  pub fn set_animation_speed(&mut self, speed: f32) { self.animation_speed = speed; }
+  pub fn set_animation_speed(&mut self, speed: f32) {
+    self.animation_speed = speed;
+  }
 
   /// Selects seeds, prepares uniform animation samples, and launches the GPU
   /// trace plus adaptive Catmull–Rom post-process passes.
@@ -1444,6 +1493,7 @@ impl Viewer {
     vertex_count: usize,
     seed_count: u32,
     sampling_rate: f32,
+    options: SpacetimeSelectionOptions,
   ) -> Result<wgpu::Buffer> {
     if vertex_count == 0 || seed_count == 0 {
       bail!("uniform spacetime selection requires at least one source vertex")
@@ -1641,6 +1691,15 @@ impl Viewer {
       ],
     });
     let selection_workgroups = (vertex_count_u32 + 63) / 64;
+    let max_workgroups = self.device.limits().max_compute_workgroups_per_dimension;
+    let pair_workgroups_x = vertex_count_u32.min(max_workgroups);
+    let pair_workgroups_y = vertex_count_u32
+      .checked_add(pair_workgroups_x - 1)
+      .map(|count| count / pair_workgroups_x)
+      .ok_or_else(|| anyhow!("spacetime seed pair dispatch size overflow"))?;
+    if pair_workgroups_y > max_workgroups {
+      bail!("spacetime seed pair dispatch exceeds the GPU workgroup limit")
+    }
     let selection_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
       label:              Some("spacetime seed selection parameters"),
       size:               selection_params_bytes,
@@ -1678,20 +1737,23 @@ impl Viewer {
       ],
     });
     let mut selection_passes = Vec::with_capacity(selection_pass_count as usize);
-    let mut add_selection_pass = |stage: u32, selected_count: u32, workgroups: u32| {
-      selection_passes.push((stage, selected_count, workgroups));
+    let mut add_selection_pass =
+      |stage: u32, selected_count: u32, workgroups_x: u32, workgroups_y: u32| {
+        selection_passes.push((stage, selected_count, workgroups_x, workgroups_y));
     };
     if seed_count > 1 {
-      add_selection_pass(0, 0, selection_workgroups);
+      // Stage 0 uses selected_count as the x dimension when mapping its
+      // two-dimensional dispatch back to one left-hand vertex per group.
+      add_selection_pass(0, pair_workgroups_x, pair_workgroups_x, pair_workgroups_y);
     }
     // This pass also handles the one-seed degenerate case.
-    add_selection_pass(1, 0, 1);
+    add_selection_pass(1, 0, 1, 1);
     if seed_count > 2 {
-      add_selection_pass(2, 2, selection_workgroups);
+      add_selection_pass(2, 2, selection_workgroups, 1);
       for selected_count in 2..seed_count {
-        add_selection_pass(3, selected_count, 1);
+        add_selection_pass(3, selected_count, 1, 1);
         if selected_count + 1 < seed_count {
-          add_selection_pass(4, selected_count, selection_workgroups);
+          add_selection_pass(4, selected_count, selection_workgroups, 1);
         }
       }
     }
@@ -1712,14 +1774,16 @@ impl Viewer {
     }
     self.queue.submit(Some(encoder.finish()));
 
-    for (stage, selected_count, workgroups) in selection_passes {
+    for (stage, selected_count, workgroups_x, workgroups_y) in selection_passes {
       let selection_params = SpacetimeSeedSelectionParams {
         vertex_count: vertex_count_u32,
         sample_count: pose.sample_count,
         seed_count,
         stage,
         selected_count,
-        _padding: [0; 3],
+        importance: u32::from(options.importance),
+        stochastic: u32::from(options.stochastic),
+        extended: u32::from(options.extended),
       };
       self.queue.write_buffer(
         &selection_params_buffer,
@@ -1737,7 +1801,7 @@ impl Viewer {
       });
       pass.set_pipeline(&self.motion_seed_selection_pipeline);
       pass.set_bind_group(0, &selection_bind, &[]);
-      pass.dispatch_workgroups(workgroups, 1, 1);
+      pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
       drop(pass);
       self.queue.submit(Some(encoder.finish()));
     }
@@ -1782,12 +1846,9 @@ impl Viewer {
     if self.mesh.vertices.len() != vertex_count {
       bail!("motion-line source and animated vertex counts differ")
     }
-    let (samples, spacetime_seed_buffer) = match &config.seed_selection {
-      SeedSelectionAlgorithm::UniformSpacetimeVertices {
-        count,
-        sampling_rate,
-      } => {
-        let seed_count = (*count).min(vertex_count);
+    let (samples, spacetime_seed_buffer) = match config.seed_selection.spacetime_options() {
+      Some((count, sampling_rate, options)) => {
+        let seed_count = count.min(vertex_count);
         let low_rate_pose = {
           let scene = self
             .scene
@@ -1798,14 +1859,15 @@ impl Viewer {
             animation,
             palette_stride,
             morph_stride,
-            *sampling_rate,
+            sampling_rate,
           )?
         };
         let seed_buffer = self.trace_spacetime_seed_selection(
           &low_rate_pose,
           vertex_count,
           seed_count as u32,
-          *sampling_rate,
+          sampling_rate,
+          options,
         )?;
         // The low-rate CPU pose vectors are no longer needed once the GPU
         // selector has been submitted. Do not retain them alongside the
@@ -2254,7 +2316,9 @@ impl Viewer {
   /// Computes a conservative radius for the mesh bounds used by the camera's
   /// depth range. Camera poses can move far away from the initial framing, so
   /// using a unit radius here would clip large FBX/glTF assets.
-  fn bounds_radius(min: Vec3, max: Vec3) -> f32 { ((max - min) * 0.5).length().max(0.01) }
+  fn bounds_radius(min: Vec3, max: Vec3) -> f32 {
+    ((max - min) * 0.5).length().max(0.01)
+  }
 
   /// Applies a script-provided camera pose and keeps the clipping range tied
   /// to the actual mesh rather than to a placeholder unit-sized object.
@@ -2651,7 +2715,9 @@ fn process_rss_bytes() -> Option<u64> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_rss_bytes() -> Option<u64> { None }
+fn process_rss_bytes() -> Option<u64> {
+  None
+}
 
 fn format_bytes(bytes: u64) -> String {
   const KIB: f64 = 1024.0;

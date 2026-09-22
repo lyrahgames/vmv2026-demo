@@ -658,7 +658,9 @@ impl AnimatedScene {
   }
 
   /// Returns the initial static frame used while the GPU viewer is created.
-  pub fn initial_mesh(&self) -> Mesh { self.sample(None, 0.0) }
+  pub fn initial_mesh(&self) -> Mesh {
+    self.sample(None, 0.0)
+  }
 }
 
 /// FBX files may store either decomposed TRS or a matrix. The renderer's
@@ -1476,7 +1478,9 @@ struct AnimationClip {
 }
 
 impl AnimationClip {
-  fn info(&self) -> AnimationInfo { self.info.clone() }
+  fn info(&self) -> AnimationInfo {
+    self.info.clone()
+  }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

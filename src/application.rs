@@ -180,7 +180,14 @@ impl TaskQueue {
     self.enqueue(move |viewer| viewer.scene_replace_with_mesh(scene, initial_mesh));
   }
 
-  pub fn reset_camera(&self) { self.enqueue(|viewer| viewer.reset_camera()); }
+  pub fn reset_camera(&self) {
+    self.enqueue(|viewer| viewer.reset_camera());
+  }
+
+  /// Frames the complete selected animation while keeping the camera fixed.
+  pub fn frame_animation(&self) {
+    self.enqueue(|viewer| viewer.frame_animation());
+  }
 
   /// Selects a loaded glTF animation without starting playback.
   pub fn select_animation(&self, index: usize) {
@@ -188,10 +195,14 @@ impl TaskQueue {
   }
 
   /// Starts the selected glTF animation.
-  pub fn play_animation(&self) { self.enqueue(|viewer| viewer.play_animation()); }
+  pub fn play_animation(&self) {
+    self.enqueue(|viewer| viewer.play_animation());
+  }
 
   /// Pauses the selected glTF animation.
-  pub fn pause_animation(&self) { self.enqueue(|viewer| viewer.pause_animation()); }
+  pub fn pause_animation(&self) {
+    self.enqueue(|viewer| viewer.pause_animation());
+  }
 
   /// Sets the selected animation's current time in seconds.
   pub fn set_animation_time(&self, time: f32) {
@@ -214,7 +225,9 @@ impl TaskQueue {
     });
   }
 
-  pub fn clear_motion_lines(&self) { self.enqueue(|viewer| viewer.clear_motion_lines()); }
+  pub fn clear_motion_lines(&self) {
+    self.enqueue(|viewer| viewer.clear_motion_lines());
+  }
 
   /// Queues a native diagnostic of CPU RSS and viewer-owned GPU allocations.
   /// The action is deferred because Lua scripts run before the wgpu viewer is
@@ -260,7 +273,8 @@ impl TaskQueue {
   pub fn enqueue_async<T: 'static, F, Fut>(&self, routine: F) -> oneshot::Receiver<T>
   where
     F: FnOnce(ViewerTaskClient) -> Fut + 'static,
-    Fut: Future<Output = T> + 'static, {
+    Fut: Future<Output = T> + 'static,
+  {
     let (send, receive) = oneshot::channel();
     self.push(ViewerTask::Async {
       id:      None,
@@ -457,15 +471,21 @@ impl TaskQueue {
 }
 
 impl Default for TaskQueue {
-  fn default() -> Self { Self::new() }
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 impl ViewerTaskClient {
   /// Schedules a graphics-side continuation of an async routine.
-  pub fn enqueue(&self, action: impl FnOnce(&mut Viewer) + 'static) { self.queue.enqueue(action); }
+  pub fn enqueue(&self, action: impl FnOnce(&mut Viewer) + 'static) {
+    self.queue.enqueue(action);
+  }
 
   /// Uses a mesh obtained asynchronously as the next viewer mesh.
-  pub fn set_mesh(&self, mesh: Mesh) { self.queue.set_mesh(mesh); }
+  pub fn set_mesh(&self, mesh: Mesh) {
+    self.queue.set_mesh(mesh);
+  }
 }
 
 /// Winit user events contain no closures. Closures stay in [`TaskQueue`],
@@ -763,7 +783,9 @@ impl App {
   }
 
   #[cfg(target_arch = "wasm32")]
-  fn drain_tasks(&self) { self.drain_web_tasks(); }
+  fn drain_tasks(&self) {
+    self.drain_web_tasks();
+  }
 
   #[cfg(target_arch = "wasm32")]
   fn drain_web_tasks(&self) {

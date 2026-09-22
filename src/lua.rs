@@ -9,7 +9,7 @@ use crate::{
   camera::CameraConfig,
   common::*,
   mesh::Mesh,
-  motion_lines::{MotionLineConfig, SeedSelectionAlgorithm},
+  motion_lines::{ImportanceSelectionMode, MotionLineConfig, SeedSelectionAlgorithm},
   scene::AnimatedScene,
   scene::AnimationInfo,
 };
@@ -281,6 +281,62 @@ pub fn tasks(path: &str) -> Result<TaskQueue> {
     .set(
       "set_motion_lines_uniform_spacetime",
       set_motion_lines_uniform_spacetime,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+  let importance_motion_lines = queue.clone();
+  let set_motion_lines_importance_spacetime = lua
+    .create_function(
+      move |_, (count, sampling_rate, stochastic, fps): (usize, f32, bool, f32)| {
+        importance_motion_lines.configure_motion_lines(MotionLineConfig {
+          seed_selection: SeedSelectionAlgorithm::ImportanceSpacetimeVertices {
+            count,
+            sampling_rate,
+            mode: if stochastic {
+              ImportanceSelectionMode::Stochastic
+            } else {
+              ImportanceSelectionMode::Deterministic
+            },
+          },
+          frames_per_second: fps,
+        });
+        Ok(())
+      },
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set(
+      "set_motion_lines_importance_spacetime",
+      set_motion_lines_importance_spacetime,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+  let extended_importance_motion_lines = queue.clone();
+  let set_motion_lines_extended_importance_spacetime = lua
+    .create_function(
+      move |_, (count, sampling_rate, stochastic, fps): (usize, f32, bool, f32)| {
+        extended_importance_motion_lines.configure_motion_lines(MotionLineConfig {
+          seed_selection: SeedSelectionAlgorithm::ExtendedImportanceSpacetimeVertices {
+            count,
+            sampling_rate,
+            mode: if stochastic {
+              ImportanceSelectionMode::Stochastic
+            } else {
+              ImportanceSelectionMode::Deterministic
+            },
+          },
+          frames_per_second: fps,
+        });
+        Ok(())
+      },
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set(
+      "set_motion_lines_extended_importance_spacetime",
+      set_motion_lines_extended_importance_spacetime,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
 
