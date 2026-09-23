@@ -11,6 +11,7 @@ use crate::{
   mesh::Mesh,
   motion_lines::{ImportanceSelectionMode, MotionLineConfig, SeedSelectionAlgorithm},
   scene::{AnimatedScene, AnimationInfo},
+  viewer::MotionLineRenderStyle,
 };
 use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
@@ -393,6 +394,21 @@ impl ViewerHandle {
     if let Some(queue) = self.queue() {
       queue.clear_web_motion_lines(self.id);
     }
+  }
+
+  /// Selects a line style without rerunning the seed selection or trace.
+  #[wasm_bindgen(js_name = setMotionLineStyle)]
+  pub fn set_motion_line_style(&self, name: String) -> Result<(), JsValue> {
+    let style = match name.as_str() {
+      "teaser" => MotionLineRenderStyle::Teaser,
+      "dashed" => MotionLineRenderStyle::Dashed,
+      _ => return Err(JsValue::from_str("unknown motion-line style; expected 'teaser' or 'dashed'")),
+    };
+    let Some(queue) = self.queue() else {
+      return Err(JsValue::from_str("viewer runtime has stopped"));
+    };
+    queue.set_web_motion_line_style(self.id, style);
+    Ok(())
   }
 
   pub fn set_camera(

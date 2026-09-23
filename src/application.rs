@@ -8,7 +8,8 @@
 use crate::camera::CameraFollowConfig;
 use crate::{
   camera::CameraConfig, common::*, interaction::Interaction, mesh::Mesh,
-  motion_lines::MotionLineConfig, scene::AnimatedScene, viewer::Viewer,
+  motion_lines::MotionLineConfig, scene::AnimatedScene,
+  viewer::{MotionLineRenderStyle, Viewer},
 };
 use futures::{
   Future, FutureExt, executor::LocalPool, future::LocalBoxFuture, task::LocalSpawnExt,
@@ -227,6 +228,11 @@ impl TaskQueue {
 
   pub fn clear_motion_lines(&self) {
     self.enqueue(|viewer| viewer.clear_motion_lines());
+  }
+
+  /// Selects the line fragment style without retracing the animation.
+  pub fn set_motion_line_style(&self, style: MotionLineRenderStyle) {
+    self.enqueue(move |viewer| viewer.set_motion_line_style(style));
   }
 
   /// Queues a native diagnostic of CPU RSS and viewer-owned GPU allocations.
@@ -481,6 +487,11 @@ impl TaskQueue {
   #[cfg(target_arch = "wasm32")]
   pub fn clear_web_motion_lines(&self, id: u64) {
     self.enqueue_web(id, |viewer| viewer.clear_motion_lines());
+  }
+
+  #[cfg(target_arch = "wasm32")]
+  pub fn set_web_motion_line_style(&self, id: u64, style: MotionLineRenderStyle) {
+    self.enqueue_web(id, move |viewer| viewer.set_motion_line_style(style));
   }
 }
 

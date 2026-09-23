@@ -30,7 +30,7 @@ struct MotionLineStyle {
   // now, visible tail duration, characteristic length, reserved
   timing:   vec4<f32>,
   // complete screen-space strip width in pixels, maximum halo depth
-  // displacement, reserved, reserved
+  // displacement, dashed-style flag (0 or 1), reserved
   widths:   vec4<f32>,
   // physical viewport width and height in pixels
   viewport: vec4<f32>,
@@ -60,6 +60,9 @@ struct LineOut {
   @location(2) arc: f32,
   @location(3) speed: f32,
   @location(4) valid: f32,
+  // Cumulative trajectory length, retained for styles such as dashes whose
+  // phase is anchored to the complete stroke rather than the moving seed.
+  @location(5) cumulative_arc: f32,
 };
 
 struct LineFragmentOut {
@@ -237,6 +240,20 @@ fn temporal_weight(time: f32, arc: f32, speed: f32) -> f32 {
   return begin_mask * end_mask * decay_mask * speed_mask;
 }
 
+// Geometry weight from paper-compasso's bundle vertex shader. The Compasso
+// dash and speed masks belong exclusively to its fragment shader.
+fn compasso_geometry_weight(time: f32, arc: f32) -> f32 {
+  let delta = max(line_style.timing.y, 1.0e-4);
+  let age = line_style.timing.x - time;
+  if (age < 0.0 || age > delta) {
+    return 0.0;
+  }
+  let characteristic_length = max(line_style.timing.z, 1.0e-4);
+  let begin_mask = smoothstep(0.02, 0.05, max(arc, 0.0) / characteristic_length);
+  let end_mask = 1.0 - smoothstep(0.95 * delta, delta, age);
+  return begin_mask * end_mask * exp(-2.0 * age / delta);
+}
+
 @vertex
 fn line_vertex(
   @builtin(vertex_index) vertex_index: u32,
@@ -337,19 +354,29 @@ fn line_vertex(
       / max(next_sample.metadata.x - previous_sample.metadata.x, 1.0e-6),
     0.0,
   );
-  let stroke_weight = temporal_weight(current_sample.metadata.x, arc, speed);
-  let pixel_offset = side * line_style.widths.x * 0.5 * extrusion * stroke_weight;
+  let compasso_style = line_style.widths.z > 0.5;
+  let stroke_weight = select(
+    temporal_weight(current_sample.metadata.x, arc, speed),
+    compasso_geometry_weight(current_sample.metadata.x, arc),
+    compasso_style,
+  );
+  // Compasso emits an outer extent at +/-1.5 line widths and interpolates
+  // its fragment coordinate across +/-3. The teaser keeps its existing
+  // +/-0.5-width strip and +/-1 coordinate exactly.
+  let half_extent = select(0.5, 1.5, compasso_style);
+  let pixel_offset = side * line_style.widths.x * half_extent * extrusion * stroke_weight;
   let ndc_offset = 2.0 * pixel_offset / viewport;
 
   var clip = current_clip;
   clip.x += ndc_offset.x * clip.w;
   clip.y += ndc_offset.y * clip.w;
   output.position = clip;
-  output.width_coordinate = side;
+  output.width_coordinate = side * select(1.0, 3.0, compasso_style);
   output.time = current_sample.metadata.x;
   output.arc = arc;
   output.speed = speed;
   output.valid = valid;
+  output.cumulative_arc = current_sample.metadata.y;
   return output;
 }
 

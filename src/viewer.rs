@@ -49,6 +49,17 @@ const CAMERA_TARGET_STENCIL_PASSES: usize = 12;
 /// resolve all of those formats.
 const PREFERRED_MSAA_SAMPLE_COUNT: u32 = 4;
 
+/// Selects the fragment shader used for an already extracted motion-line
+/// bundle. Switching styles deliberately does not retrace trajectories.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MotionLineRenderStyle {
+  /// The original presentation stroke. This remains the default.
+  #[default]
+  Teaser,
+  /// The arc-length dashed stroke adapted from `paper-compasso`.
+  Dashed,
+}
+
 /// GPU buffers for an animated scene.  Geometry and indices are immutable;
 /// only the compact transform palette is uploaded as the pose changes.
 struct AnimatedGpuState {
@@ -123,7 +134,7 @@ struct SpacetimeSeedSelectionParams {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct MotionLineStyle {
   timing:   [f32; 4], // now, visible tail duration, characteristic length, reserved
-  widths:   [f32; 4], // strip width px, max depth halo, reserved, reserved
+  widths:   [f32; 4], // strip width px, max depth halo, Compasso-style flag, reserved
   viewport: [f32; 4], // physical width px, physical height px
 }
 
@@ -401,6 +412,7 @@ pub struct Viewer {
   pipeline: wgpu::RenderPipeline,
   animated_pipeline: wgpu::RenderPipeline,
   motion_line_pipeline: wgpu::RenderPipeline,
+  motion_line_dashed_pipeline: wgpu::RenderPipeline,
   motion_composite_pipeline: wgpu::RenderPipeline,
   motion_trace_pipeline: wgpu::ComputePipeline,
   motion_post_pipeline: wgpu::ComputePipeline,
@@ -421,6 +433,7 @@ pub struct Viewer {
   motion_composite_bind: wgpu::BindGroup,
   animated: Option<AnimatedGpuState>,
   motion_line_config: Option<MotionLineConfig>,
+  motion_line_style: MotionLineRenderStyle,
   motion_lines: Option<MotionLineGpuState>,
   last_motion_line_peak_bytes: u64,
   // MSAA color is resolved into the acquired surface texture. The depth
@@ -654,6 +667,16 @@ impl Viewer {
     let motion_line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
       label:  Some("motion-line render shader"),
       source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_lines.wgsl").into()),
+    });
+    // The dashed fragment is kept in its own WGSL file, but shares the
+    // geometry, OIT declarations, and helpers embedded above.
+    let motion_line_dashed_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+      label: Some("motion-line dashed render shader"),
+      source: wgpu::ShaderSource::Wgsl(concat!(
+        include_str!("../shaders/motion_lines.wgsl"),
+        "\n",
+        include_str!("../shaders/motion_lines_dashed.wgsl"),
+      ).into()),
     });
     let camera = Camera::new(config.width as f32 / config.height as f32);
     // Uniforms contain one 4x4 matrix and two vec4 values (96 bytes).
@@ -994,6 +1017,65 @@ impl Viewer {
       multiview:     None,
       cache:         None,
     });
+    let motion_line_dashed_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+      label:  Some("motion-line dashed render pipeline"),
+      layout: Some(&motion_line_pipeline_layout),
+      vertex: wgpu::VertexState {
+        module:              &motion_line_dashed_shader,
+        entry_point:         Some("line_vertex"),
+        buffers:             &[],
+        compilation_options: Default::default(),
+      },
+      fragment: Some(wgpu::FragmentState {
+        module:      &motion_line_dashed_shader,
+        entry_point: Some("dashed_line_fragment"),
+        targets: &[
+          Some(wgpu::ColorTargetState {
+            format: wgpu::TextureFormat::Rgba16Float,
+            blend: Some(wgpu::BlendState {
+              color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+              },
+              alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+              },
+            }),
+            write_mask: wgpu::ColorWrites::ALL,
+          }),
+          Some(wgpu::ColorTargetState {
+            format: wgpu::TextureFormat::R8Unorm,
+            blend: Some(wgpu::BlendState {
+              color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+              },
+              alpha: wgpu::BlendComponent::REPLACE,
+            }),
+            write_mask: wgpu::ColorWrites::RED,
+          }),
+        ],
+        compilation_options: Default::default(),
+      }),
+      primitive: wgpu::PrimitiveState {
+        topology: wgpu::PrimitiveTopology::TriangleStrip,
+        ..Default::default()
+      },
+      depth_stencil: Some(wgpu::DepthStencilState {
+        format:              wgpu::TextureFormat::Depth24Plus,
+        depth_write_enabled: false,
+        depth_compare:       wgpu::CompareFunction::LessEqual,
+        stencil:             Default::default(),
+        bias:                Default::default(),
+      }),
+      multisample: multisample_state(sample_count),
+      multiview:   None,
+      cache:       None,
+    });
     let motion_composite_pipeline_layout =
       device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label:                Some("motion-line OIT composite pipeline layout"),
@@ -1089,6 +1171,7 @@ impl Viewer {
       pipeline,
       animated_pipeline,
       motion_line_pipeline,
+      motion_line_dashed_pipeline,
       motion_composite_pipeline,
       motion_trace_pipeline,
       motion_post_pipeline,
@@ -1109,6 +1192,7 @@ impl Viewer {
       motion_composite_bind,
       animated: None,
       motion_line_config: None,
+      motion_line_style: MotionLineRenderStyle::default(),
       motion_lines: None,
       last_motion_line_peak_bytes: 0,
       sample_count,
@@ -1463,6 +1547,11 @@ impl Viewer {
     if let Some(lines) = self.motion_lines.take() {
       lines.destroy();
     }
+  }
+
+  /// Changes only the rendering style of the current/future line bundle.
+  pub fn set_motion_line_style(&mut self, style: MotionLineRenderStyle) {
+    self.motion_line_style = style;
   }
 
   /// Prints process RSS and the exact sizes of buffers owned by this viewer.
@@ -2216,9 +2305,8 @@ impl Viewer {
       });
     let style = MotionLineStyle {
       timing:   [0.0, 0.75, model_diagonal.max(1.0e-4), 0.0],
-      // The teaser used line_width=10 with outer coordinates +/-1.5, i.e.
-      // a 30-pixel complete strip. Use a slightly heavier 34-pixel contour
-      // for the presentation style.
+      // Initial state is the unchanged teaser style. The per-frame write
+      // below switches these values when the script selected Compasso.
       widths:   [34.0, 0.01, 0.0, 0.0],
       viewport: [
         self.config.width as f32,
@@ -2738,15 +2826,18 @@ impl Viewer {
         0.0
       };
       let model_diagonal = (self.mesh.max - self.mesh.min).length().max(1.0e-4);
+      let (tail_duration, strip_width, halo_depth, compasso_style) = match self.motion_line_style {
+        MotionLineRenderStyle::Teaser => (0.75, 34.0, 0.01, 0.0),
+        // Retain the Compasso width construction, but use a two-times longer
+        // visible tail so the dash rhythm remains readable in the slides.
+        MotionLineRenderStyle::Dashed => (1.6, 8.0, 0.0, 1.0),
+      };
       self.queue.write_buffer(
         &lines.style,
         0,
         bytemuck::bytes_of(&MotionLineStyle {
-          timing:   [now, 0.75, model_diagonal, 0.0],
-          // The original teaser used a 10-pixel half-width parameter with
-          // outer coordinates at +/-1.5. This slightly larger normalized
-          // strip restores that visibly heavier contour.
-          widths:   [34.0, 0.01, 0.0, 0.0],
+          timing:   [now, tail_duration, model_diagonal, 0.0],
+          widths:   [strip_width, halo_depth, compasso_style, 0.0],
           viewport: [
             self.config.width as f32,
             self.config.height as f32,
@@ -2798,7 +2889,10 @@ impl Viewer {
           occlusion_query_set:      None,
           timestamp_writes:         None,
         });
-        pass.set_pipeline(&self.motion_line_pipeline);
+        pass.set_pipeline(match self.motion_line_style {
+          MotionLineRenderStyle::Teaser => &self.motion_line_pipeline,
+          MotionLineRenderStyle::Dashed => &self.motion_line_dashed_pipeline,
+        });
         pass.set_bind_group(0, &self.bind, &[]);
         pass.set_bind_group(1, &lines.line_bind, &[]);
         // Two vertices per trajectory sample form one continuous strip per

@@ -12,6 +12,7 @@ use crate::{
   motion_lines::{ImportanceSelectionMode, MotionLineConfig, SeedSelectionAlgorithm},
   scene::AnimatedScene,
   scene::AnimationInfo,
+  viewer::MotionLineRenderStyle,
 };
 use mlua::{Lua, Table};
 
@@ -398,6 +399,27 @@ pub fn tasks(path: &str) -> Result<TaskQueue> {
   lua
     .globals()
     .set("clear_motion_lines", clear_motion_lines_function)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+  let style_queue = queue.clone();
+  let set_motion_line_style = lua
+    .create_function(move |_, name: String| {
+      let selected_style = match name.as_str() {
+        "teaser" => MotionLineRenderStyle::Teaser,
+        "dashed" => MotionLineRenderStyle::Dashed,
+        _ => {
+          return Err(mlua::Error::external(
+            "unknown motion-line style; expected 'teaser' or 'dashed'",
+          ));
+        }
+      };
+      style_queue.set_motion_line_style(selected_style);
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("set_motion_line_style", set_motion_line_style)
     .map_err(|e| anyhow!(e.to_string()))?;
 
   let print_memory = queue.clone();
