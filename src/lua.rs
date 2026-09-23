@@ -145,6 +145,54 @@ pub fn tasks(path: &str) -> Result<TaskQueue> {
     .set("set_background_color", set_background_color)
     .map_err(|e| anyhow!(e.to_string()))?;
 
+  let frame = queue.clone();
+  let frame_animation = lua
+    .create_function(move |_, ()| {
+      frame.frame_animation();
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("frame_animation", frame_animation)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+  let hide = queue.clone();
+  let hide_scene = lua
+    .create_function(move |_, ()| {
+      hide.hide_scene();
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("hide_scene", hide_scene)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+  let show = queue.clone();
+  let show_scene = lua
+    .create_function(move |_, ()| {
+      show.show_scene();
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("show_scene", show_scene)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+  let screenshot = queue.clone();
+  let save_screenshot = lua
+    .create_function(move |_, path: String| {
+      screenshot.request_screenshot(path);
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("save_screenshot", save_screenshot)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
   let select = queue.clone();
   let select_animation = lua
     .create_function(move |_, index: usize| {

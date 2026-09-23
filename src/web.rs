@@ -205,6 +205,23 @@ impl ViewerHandle {
     Ok(())
   }
 
+  /// Hides the retained scene while Slidev moves the shared viewer to another
+  /// canvas or while the next slide loads its model.
+  #[wasm_bindgen(js_name = hideScene)]
+  pub fn hide_scene(&self) {
+    if let Some(queue) = self.queue() {
+      queue.enqueue_web(self.id, |viewer| viewer.hide_scene());
+    }
+  }
+
+  /// Reveals a scene after the slide's JavaScript setup has completed.
+  #[wasm_bindgen(js_name = showScene)]
+  pub fn show_scene(&self) {
+    if let Some(queue) = self.queue() {
+      queue.enqueue_web(self.id, |viewer| viewer.show_scene());
+    }
+  }
+
   pub fn resize(&self, width: u32, height: u32) {
     if let Some(queue) = self.queue() {
       let size = winit::dpi::PhysicalSize::new(width.max(1), height.max(1));

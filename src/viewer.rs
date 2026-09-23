@@ -379,6 +379,9 @@ pub struct Viewer {
   animation_time: f32,
   animation_speed: f32,
   animation_playing: bool,
+  // The shared viewer survives slide transitions, but its old scene must not
+  // remain visible while the next slide is loading.
+  scene_visible: bool,
   camera_follow: Option<ActiveCameraFollow>,
   camera_target_path: Option<CameraTargetPath>,
   // The instance is retained on wasm so the existing device can create a
@@ -389,6 +392,9 @@ pub struct Viewer {
   // `'static` is valid because the Arc<Window> passed to create_surface is
   // retained by AppState for at least as long as this surface.
   surface: Option<wgpu::Surface<'static>>,
+  // Native preview rendering uses an offscreen texture instead of a surface.
+  #[cfg(not(target_arch = "wasm32"))]
+  headless_target: Option<wgpu::Texture>,
   device: wgpu::Device,
   queue: wgpu::Queue,
   config: wgpu::SurfaceConfiguration,
@@ -430,6 +436,13 @@ pub struct Viewer {
   // Keeping this in the viewer rather than the surface configuration makes
   // the same script API work on native sRGB and browser UNORM surfaces.
   background_color: [f32; 3],
+  #[cfg(not(target_arch = "wasm32"))]
+  // Native preview scripts may request one readback from the next rendered
+  // offscreen frame. This stays out of the browser build, where the fallback
+  // assets are deliberately not generated at runtime.
+  screenshot_path: Option<std::path::PathBuf>,
+  #[cfg(not(target_arch = "wasm32"))]
+  screenshot_complete: bool,
 }
 
 impl Drop for Viewer {
@@ -439,6 +452,10 @@ impl Drop for Viewer {
     // browser-side GPUDevice to release all buffers before the next slide
     // creates another device. Explicit destruction is essential for the
     // slide deck, which replaces animated models repeatedly.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(target) = self.headless_target.take() {
+      target.destroy();
+    }
     self.device.destroy();
   }
 }
@@ -461,17 +478,13 @@ impl Viewer {
       .unwrap_or_else(|| window.inner_size())
   }
 
-  /// Creates the wgpu instance, surface, device, pipeline, and mesh buffers.
-  ///
-  /// This is async because adapter and device requests may cross the browser
-  /// WebGPU promise boundary.  The native caller drives it with pollster.
+  /// Creates a surface-backed viewer for the interactive native and web applications.
   pub async fn new(window: Arc<Window>, mesh: Mesh) -> Result<Self> {
     #[cfg(target_arch = "wasm32")]
     let size = Self::initial_surface_size(&window);
     #[cfg(not(target_arch = "wasm32"))]
     let size = window.inner_size();
-    // The surface is tied to the window/canvas.  Keeping the Window in an
-    // Arc lets wgpu own a static surface handle while AppState owns the Arc too.
+
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let surface = instance.create_surface(window)?;
     let adapter = instance
@@ -481,8 +494,6 @@ impl Viewer {
         force_fallback_adapter: false,
       })
       .await?;
-    // Request only baseline features so the same renderer works on native
-    // GPUs, browser WebGPU implementations, and software adapters.
     let (device, queue) = adapter
       .request_device(&wgpu::DeviceDescriptor {
         label:             Some("device"),
@@ -493,11 +504,6 @@ impl Viewer {
       })
       .await?;
     let caps = surface.get_capabilities(&adapter);
-    // Prefer an sRGB format for predictable colors, with the first browser
-    // supported format as a fallback. A browser can report no usable
-    // formats while a canvas is being torn down or when its WebGPU
-    // implementation rejects the requested surface. Return that failure
-    // to the caller instead of indexing an empty vector and aborting WASM.
     let format = caps
       .formats
       .iter()
@@ -505,9 +511,6 @@ impl Viewer {
       .find(|f| f.is_srgb())
       .or_else(|| caps.formats.first().copied())
       .ok_or_else(|| anyhow!("WebGPU surface reported no supported formats"))?;
-    // Native surfaces normally offer an sRGB target, but some browser
-    // canvases expose only an UNORM target. The shader needs to encode its
-    // linear lighting output itself in the latter case.
     let encode_srgb = (!format.is_srgb()) as u8 as f32;
     let sample_count = choose_msaa_sample_count(&adapter, format);
     let alpha_mode = caps
@@ -526,6 +529,104 @@ impl Viewer {
       desired_maximum_frame_latency: 2,
     };
     surface.configure(&device, &config);
+
+    Self::new_with_graphics(
+      mesh,
+      Some(surface),
+      device,
+      queue,
+      config,
+      format,
+      encode_srgb,
+      sample_count,
+      Some(instance),
+      None,
+    )
+  }
+
+  /// Creates a viewer whose render target is an offscreen texture.
+  ///
+  /// This path deliberately never creates a winit window or a surface. It is
+  /// used by the manual preview command and therefore works on CI runners
+  /// without Wayland, X11, or a display server.
+  #[cfg(not(target_arch = "wasm32"))]
+  pub async fn new_headless(
+    size: winit::dpi::PhysicalSize<u32>,
+    mesh: Mesh,
+  ) -> Result<Self> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter_options = |force_fallback_adapter| wgpu::RequestAdapterOptions {
+      power_preference:       wgpu::PowerPreference::LowPower,
+      compatible_surface:     None,
+      force_fallback_adapter,
+    };
+    let adapter = match instance.request_adapter(&adapter_options(false)).await {
+      Ok(adapter) => adapter,
+      Err(_) => instance.request_adapter(&adapter_options(true)).await?,
+    };
+    let (device, queue) = adapter
+      .request_device(&wgpu::DeviceDescriptor {
+        label:             Some("headless preview device"),
+        required_features: wgpu::Features::empty(),
+        required_limits:   wgpu::Limits::default(),
+        memory_hints:      wgpu::MemoryHints::Performance,
+        trace:             wgpu::Trace::Off,
+      })
+      .await?;
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let config = wgpu::SurfaceConfiguration {
+      usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+      format,
+      width: size.width.max(1),
+      height: size.height.max(1),
+      present_mode: wgpu::PresentMode::Fifo,
+      alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+      view_formats: vec![],
+      desired_maximum_frame_latency: 2,
+    };
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+      label: Some("headless preview target"),
+      size: wgpu::Extent3d {
+        width: config.width,
+        height: config.height,
+        depth_or_array_layers: 1,
+      },
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: wgpu::TextureDimension::D2,
+      format,
+      usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+      view_formats: &[],
+    });
+    let sample_count = choose_msaa_sample_count(&adapter, format);
+
+    Self::new_with_graphics(
+      mesh,
+      None,
+      device,
+      queue,
+      config,
+      format,
+      0.0,
+      sample_count,
+      None,
+      Some(target),
+    )
+  }
+
+  fn new_with_graphics(
+    mesh: Mesh,
+    surface: Option<wgpu::Surface<'static>>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    format: wgpu::TextureFormat,
+    encode_srgb: f32,
+    sample_count: u32,
+    _instance: Option<wgpu::Instance>,
+    _headless_target: Option<wgpu::Texture>,
+  ) -> Result<Self> {
     // The shader is embedded at compile time, keeping the WASM deployment
     // self-contained instead of requiring a second shader fetch.
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -974,11 +1075,14 @@ impl Viewer {
       animation_time: 0.0,
       animation_speed: 1.0,
       animation_playing: false,
+      scene_visible: true,
       camera_follow: None,
       camera_target_path: None,
       #[cfg(target_arch = "wasm32")]
-      instance,
-      surface: Some(surface),
+      instance: _instance.expect("surface viewers retain their wgpu instance"),
+      surface,
+      #[cfg(not(target_arch = "wasm32"))]
+      headless_target: _headless_target,
       device,
       queue,
       config,
@@ -1015,6 +1119,10 @@ impl Viewer {
       // White is a neutral default for the presentation and for scripts
       // that do not need a custom backdrop.
       background_color: [1.0, 1.0, 1.0],
+      #[cfg(not(target_arch = "wasm32"))]
+      screenshot_path: None,
+      #[cfg(not(target_arch = "wasm32"))]
+      screenshot_complete: false,
     };
     s.reset_camera();
     Ok(s)
@@ -2465,33 +2573,71 @@ impl Viewer {
     });
   }
 
+  /// Hides the scene without releasing the shared device or GPU buffers.
+  pub fn hide_scene(&mut self) {
+    self.scene_visible = false;
+    self.animation_playing = false;
+  }
+
+  /// Reveals the current scene after slide setup has completed.
+  pub fn show_scene(&mut self) { self.scene_visible = true; }
+
+  /// Captures the next native offscreen frame as a PNG.
+  #[cfg(not(target_arch = "wasm32"))]
+  pub fn request_screenshot(&mut self, path: impl Into<std::path::PathBuf>) {
+    self.screenshot_path = Some(path.into());
+    self.screenshot_complete = false;
+  }
+
+  /// Returns true after the one-shot screenshot requested by Lua is written.
+  #[cfg(not(target_arch = "wasm32"))]
+  pub fn screenshot_complete(&self) -> bool { self.screenshot_complete }
+
   /// Encodes and presents one frame.
   ///
   /// Rendering is demand-driven by winit's `RedrawRequested` event.  Camera
   /// changes therefore become visible only after the app requests a redraw.
   pub fn render(&mut self) {
-    let Some(surface) = self.surface.as_ref() else {
-      // A detached viewer remains alive so its device can be reused by
-      // the next slide, but it must not render until a surface returns.
-      return;
+    let frame = match self.surface.as_ref() {
+      Some(surface) => match surface.get_current_texture() {
+        Ok(frame) => Some(frame),
+        Err(wgpu::SurfaceError::Lost) => {
+          // Lost surfaces are recoverable: configure the current size
+          // again and let the next redraw try to acquire a frame.
+          self.resize(winit::dpi::PhysicalSize::new(
+            self.config.width,
+            self.config.height,
+          ));
+          return;
+        }
+        Err(_) => {
+          // Timeout/outdated frames are transient on browsers during
+          // resize or tab scheduling.  Dropping this frame avoids a
+          // panic; the regular redraw loop will retry.
+          return;
+        }
+      },
+      None => None,
     };
-    let frame = match surface.get_current_texture() {
-      Ok(f) => f,
-      Err(wgpu::SurfaceError::Lost) => {
-        // Lost surfaces are recoverable: configure the current size
-        // again and let the next redraw try to acquire a frame.
-        self.resize(winit::dpi::PhysicalSize::new(
-          self.config.width,
-          self.config.height,
-        ));
-        return;
-      }
-      Err(_) => {
-        // Timeout/outdated frames are transient on browsers during
-        // resize or tab scheduling.  Dropping this frame avoids a
-        // panic; the regular redraw loop will retry.
-        return;
-      }
+    #[cfg(not(target_arch = "wasm32"))]
+    let screenshot_path = self.screenshot_path.take();
+    let target_texture = frame
+      .as_ref()
+      .map(|frame| &frame.texture)
+      .or_else(|| {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+          self.headless_target.as_ref()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+          None
+        }
+      });
+    let Some(target_texture) = target_texture else {
+      // A detached browser viewer remains alive so its device can be reused
+      // by the next slide, but it must not render until a surface returns.
+      return;
     };
     // Keep scripted, interactive, and resize-driven camera changes inside a
     // clipping range derived from the rendered mesh. Follow-camera mode has
@@ -2501,7 +2647,7 @@ impl Viewer {
         .camera
         .update_planes(Self::bounds_radius(self.mesh.min, self.mesh.max));
     }
-    let view = frame.texture.create_view(&Default::default());
+    let view = target_texture.create_view(&Default::default());
     let m = self.camera.view_projection().to_cols_array_2d();
     // Upload the latest camera before encoding the draw call.  The same
     // buffer is read by both vertex and fragment shader stages.
@@ -2553,23 +2699,26 @@ impl Viewer {
         timestamp_writes:         None,
       });
       pass.set_bind_group(0, &self.bind, &[]);
-      if let Some(animated) = &self.animated {
-        // Animated geometry stays immutable; bind the current pose palette
-        // and let the vertex shader perform skinning.
-        pass.set_pipeline(&self.animated_pipeline);
-        pass.set_bind_group(1, &animated.bind, &[]);
-        pass.set_vertex_buffer(0, animated.vertex.slice(..));
-        pass.set_index_buffer(animated.index.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..animated.count, 0, 0..1);
-      } else {
-        pass.set_pipeline(&self.pipeline);
-        pass.set_vertex_buffer(0, self.vertex.slice(..));
-        pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..self.count, 0, 0..1);
+      if self.scene_visible {
+        if let Some(animated) = &self.animated {
+          // Animated geometry stays immutable; bind the current pose palette
+          // and let the vertex shader perform skinning.
+          pass.set_pipeline(&self.animated_pipeline);
+          pass.set_bind_group(1, &animated.bind, &[]);
+          pass.set_vertex_buffer(0, animated.vertex.slice(..));
+          pass.set_index_buffer(animated.index.slice(..), wgpu::IndexFormat::Uint32);
+          pass.draw_indexed(0..animated.count, 0, 0..1);
+        } else {
+          pass.set_pipeline(&self.pipeline);
+          pass.set_vertex_buffer(0, self.vertex.slice(..));
+          pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
+          pass.draw_indexed(0..self.count, 0, 0..1);
+        }
       }
     }
 
-    if let Some(lines) = &self.motion_lines {
+    if self.scene_visible {
+      if let Some(lines) = &self.motion_lines {
       // The extracted bundle is complete, but the teaser style displays a
       // moving temporal tail. Updating this tiny uniform is enough to animate
       // the style without rebuilding or copying the trajectories.
@@ -2682,11 +2831,194 @@ impl Viewer {
         pass.set_bind_group(1, &self.motion_composite_bind, &[]);
         pass.draw(0..3, 0..1);
       }
+      }
     }
-    // Submit commands first, then present the acquired swap-chain frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    let screenshot = screenshot_path.map(|path| {
+      let width = self.config.width.max(1);
+      let height = self.config.height.max(1);
+      let unpadded_bytes_per_row = width.saturating_mul(4);
+      let bytes_per_row = align_copy_row(unpadded_bytes_per_row);
+      let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("native screenshot readback"),
+        size: u64::from(bytes_per_row) * u64::from(height),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+      });
+      enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+          texture: target_texture,
+          mip_level: 0,
+          origin: wgpu::Origin3d::ZERO,
+          aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+          buffer: &buffer,
+          layout: wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+          },
+        },
+        wgpu::Extent3d {
+          width,
+          height,
+          depth_or_array_layers: 1,
+        },
+      );
+      (path, buffer, width, height, bytes_per_row)
+    });
+
+    // Submit commands first, then present the acquired swap-chain frame when
+    // this is a surface-backed viewer. Headless previews have no frame to
+    // present.
     self.queue.submit(Some(enc.finish()));
-    frame.present();
+    if let Some(frame) = frame {
+      frame.present();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some((path, buffer, width, height, bytes_per_row)) = screenshot {
+      let slice = buffer.slice(..);
+      let (sender, receiver) = std::sync::mpsc::channel();
+      slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+      });
+      let map_result = self.device.poll(wgpu::PollType::Wait);
+      let result = receiver
+        .recv()
+        .ok()
+        .and_then(|result| result.ok().map(|()| map_result));
+      match result {
+        Some(Ok(_)) => {
+          let mapped = slice.get_mapped_range();
+          let mut pixels = vec![0_u8; (width as usize) * (height as usize) * 4];
+          let bgra = matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+          );
+          for row in 0..height as usize {
+            let source_start = row * bytes_per_row as usize;
+            let source = &mapped[source_start..source_start + width as usize * 4];
+            let destination_start = row * width as usize * 4;
+            for pixel in 0..width as usize {
+              let source_pixel = &source[pixel * 4..pixel * 4 + 4];
+              let destination = &mut pixels[destination_start + pixel * 4..destination_start + pixel * 4 + 4];
+              if bgra {
+                destination.copy_from_slice(&[
+                  source_pixel[2],
+                  source_pixel[1],
+                  source_pixel[0],
+                  source_pixel[3],
+                ]);
+              } else {
+                destination.copy_from_slice(source_pixel);
+              }
+            }
+          }
+          drop(mapped);
+          buffer.unmap();
+          if let Err(error) = write_png(&path, width, height, &pixels) {
+            eprintln!("could not write screenshot {}: {error:#}", path.display());
+          }
+        }
+        Some(Err(error)) => {
+          eprintln!("could not map screenshot readback: {error}");
+        }
+        None => {
+          eprintln!("screenshot readback callback did not complete");
+        }
+      }
+      self.screenshot_complete = true;
+    }
   }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn align_copy_row(bytes_per_row: u32) -> u32 {
+  let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+  bytes_per_row.div_ceil(alignment) * alignment
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_png(path: &std::path::Path, width: u32, height: u32, pixels: &[u8]) -> Result<()> {
+  if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    std::fs::create_dir_all(parent)?;
+  }
+  let row_size = width as usize * 4;
+  let mut raw = Vec::with_capacity((row_size + 1) * height as usize);
+  for row in pixels.chunks_exact(row_size).take(height as usize) {
+    raw.push(0);
+    raw.extend_from_slice(row);
+  }
+  let mut png = Vec::new();
+  png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+  let mut header = Vec::with_capacity(13);
+  header.extend_from_slice(&width.to_be_bytes());
+  header.extend_from_slice(&height.to_be_bytes());
+  header.extend_from_slice(&[8, 6, 0, 0, 0]);
+  png.extend_from_slice(&png_chunk(*b"IHDR", &header));
+  png.extend_from_slice(&png_chunk(*b"IDAT", &zlib_store(&raw)));
+  png.extend_from_slice(&png_chunk(*b"IEND", &[]));
+  std::fs::write(path, png)?;
+  Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn png_chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
+  let mut chunk = Vec::with_capacity(data.len() + 12);
+  chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
+  chunk.extend_from_slice(&kind);
+  chunk.extend_from_slice(data);
+  chunk.extend_from_slice(&crc32(&[&kind, data].concat()).to_be_bytes());
+  chunk
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn zlib_store(data: &[u8]) -> Vec<u8> {
+  let mut compressed = vec![0x78, 0x01];
+  if data.is_empty() {
+    compressed.extend_from_slice(&[1, 0, 0xff, 0xff]);
+  } else {
+    let mut offset = 0;
+    while offset < data.len() {
+      let length = (data.len() - offset).min(u16::MAX as usize);
+      let final_block = offset + length == data.len();
+      compressed.push(u8::from(final_block));
+      compressed.extend_from_slice(&(length as u16).to_le_bytes());
+      compressed.extend_from_slice(&(!(length as u16)).to_le_bytes());
+      compressed.extend_from_slice(&data[offset..offset + length]);
+      offset += length;
+    }
+  }
+  compressed.extend_from_slice(&adler32(data).to_be_bytes());
+  compressed
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn adler32(data: &[u8]) -> u32 {
+  let (mut a, mut b) = (1_u32, 0_u32);
+  for byte in data {
+    a = (a + u32::from(*byte)) % 65_521;
+    b = (b + a) % 65_521;
+  }
+  (b << 16) | a
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn crc32(data: &[u8]) -> u32 {
+  let mut crc = u32::MAX;
+  for byte in data {
+    crc ^= u32::from(*byte);
+    for _ in 0..8 {
+      crc = if crc & 1 != 0 {
+        (crc >> 1) ^ 0xedb8_8320
+      } else {
+        crc >> 1
+      };
+    }
+  }
+  !crc
 }
 
 /// Converts one linear clear-color channel when the surface is not sRGB.

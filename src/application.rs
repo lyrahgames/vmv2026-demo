@@ -246,6 +246,20 @@ impl TaskQueue {
     self.enqueue(move |viewer| viewer.set_background_color(color));
   }
 
+  pub fn hide_scene(&self) {
+    self.enqueue(|viewer| viewer.hide_scene());
+  }
+
+  pub fn show_scene(&self) {
+    self.enqueue(|viewer| viewer.show_scene());
+  }
+
+  /// Queues a one-shot native screenshot of the next rendered frame.
+  #[cfg(not(target_arch = "wasm32"))]
+  pub fn request_screenshot(&self, path: String) {
+    self.enqueue(move |viewer| viewer.request_screenshot(path));
+  }
+
   pub fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
     self.enqueue(move |viewer| viewer.resize(size));
   }
@@ -474,6 +488,34 @@ impl Default for TaskQueue {
   fn default() -> Self {
     Self::new()
   }
+}
+
+/// Executes a native Lua preview without creating a window or a wgpu surface.
+///
+/// Preview scripts are intentionally synchronous: they load the scene and
+/// queue all render configuration before the one offscreen frame is rendered.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_headless(
+  queue: TaskQueue,
+  size: winit::dpi::PhysicalSize<u32>,
+) -> Result<()> {
+  let mesh = queue
+    .initial_mesh()
+    .ok_or_else(|| anyhow!("preview script did not load a mesh or scene"))?;
+  let mut viewer = pollster::block_on(Viewer::new_headless(size, mesh))?;
+  while let Some(task) = queue.pop() {
+    match task {
+      ViewerTask::Action { action, .. } => action(&mut viewer),
+      ViewerTask::Async { .. } => {
+        bail!("asynchronous tasks are not supported by headless preview scripts")
+      }
+    }
+  }
+  viewer.render();
+  if !viewer.screenshot_complete() {
+    bail!("headless preview script did not request a screenshot")
+  }
+  Ok(())
 }
 
 impl ViewerTaskClient {
@@ -997,6 +1039,7 @@ impl App {
           queue.clear_web_state(Some(old_id));
           let mut old = self.state.borrow_mut().web_viewers.remove(&old_id).unwrap();
           if let Some(viewer) = old.viewer.as_mut() {
+            viewer.hide_scene();
             viewer.detach_surface();
           }
           drop(old.window.take());
@@ -1035,6 +1078,7 @@ impl App {
         let removed = self.state.borrow_mut().web_viewers.remove(&id);
         if let Some(mut slot) = removed {
           if let Some(viewer) = slot.viewer.as_mut() {
+            viewer.hide_scene();
             viewer.detach_surface();
           }
           drop(slot.window.take());
@@ -1424,6 +1468,12 @@ impl ApplicationHandler<ApplicationEvent> for App {
             // Lua/JavaScript command timing.
             viewer.update_animation(delta);
             viewer.render();
+            #[cfg(not(target_arch = "wasm32"))]
+            if viewer.screenshot_complete() {
+              drop(state);
+              event_loop.exit();
+              return;
+            }
             // A viewer is an animation surface, not a one-shot paint
             // surface. Request the next frame from the frame callback
             // itself; this remains reliable when no task is queued.
