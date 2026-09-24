@@ -404,6 +404,14 @@ impl ViewerHandle {
     }
   }
 
+  /// Controls motion-line drawing while retaining its GPU trajectory bundle.
+  #[wasm_bindgen(js_name = setMotionLinesVisible)]
+  pub fn set_motion_lines_visible(&self, visible: bool) {
+    if let Some(queue) = self.queue() {
+      queue.set_web_motion_lines_visible(self.id, visible);
+    }
+  }
+
   /// Selects a line style without rerunning the seed selection or trace.
   #[wasm_bindgen(js_name = setMotionLineStyle)]
   pub fn set_motion_line_style(&self, name: String) -> Result<(), JsValue> {

@@ -66,8 +66,8 @@ fn spacing_score(candidate: u32) -> f32 {
 // A deterministic hash is used for exact-distance ties. It provides stable
 // native/browser output while retaining the intended arbitrary tie choice.
 fn tie_hash(a: u32, b: u32, sample: u32, round: u32) -> u32 {
-  var value = 0x9e3779b9u ^ a * 0x85ebca6bu ^ b * 0xc2b2ae35u;
-  value = value ^ sample * 0x27d4eb2du ^ round * 0x165667b1u;
+  var value = 0x9e3779b9u ^ (a * 0x85ebca6bu) ^ (b * 0xc2b2ae35u);
+  value = value ^ (sample * 0x27d4eb2du) ^ (round * 0x165667b1u);
   value = (value ^ (value >> 16u)) * 0x7feb352du;
   value = (value ^ (value >> 15u)) * 0x846ca68bu;
   return value ^ (value >> 16u);

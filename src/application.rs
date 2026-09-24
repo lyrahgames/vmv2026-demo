@@ -234,6 +234,10 @@ impl TaskQueue {
     self.enqueue(move |viewer| viewer.set_seed_points_visible(visible));
   }
 
+  pub fn set_motion_lines_visible(&self, visible: bool) {
+    self.enqueue(move |viewer| viewer.set_motion_lines_visible(visible));
+  }
+
   /// Selects the line fragment style without retracing the animation.
   pub fn set_motion_line_style(&self, style: MotionLineRenderStyle) {
     self.enqueue(move |viewer| viewer.set_motion_line_style(style));
@@ -496,6 +500,11 @@ impl TaskQueue {
   #[cfg(target_arch = "wasm32")]
   pub fn set_web_seed_points_visible(&self, id: u64, visible: bool) {
     self.enqueue_web(id, move |viewer| viewer.set_seed_points_visible(visible));
+  }
+
+  #[cfg(target_arch = "wasm32")]
+  pub fn set_web_motion_lines_visible(&self, id: u64, visible: bool) {
+    self.enqueue_web(id, move |viewer| viewer.set_motion_lines_visible(visible));
   }
 
   #[cfg(target_arch = "wasm32")]

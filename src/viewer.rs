@@ -441,6 +441,7 @@ pub struct Viewer {
   animated: Option<AnimatedGpuState>,
   motion_line_config: Option<MotionLineConfig>,
   motion_line_style: MotionLineRenderStyle,
+  motion_lines_visible: bool,
   seed_points_visible: bool,
   motion_lines: Option<MotionLineGpuState>,
   last_motion_line_peak_bytes: u64,
@@ -1280,6 +1281,7 @@ impl Viewer {
       animated: None,
       motion_line_config: None,
       motion_line_style: MotionLineRenderStyle::default(),
+      motion_lines_visible: true,
       seed_points_visible: false,
       motion_lines: None,
       last_motion_line_peak_bytes: 0,
@@ -1437,6 +1439,8 @@ impl Viewer {
     self.scene = None;
     self.motion_line_config = None;
     self.clear_motion_lines();
+    self.motion_lines_visible = true;
+    self.seed_points_visible = false;
     self.clear_animated_gpu_state();
     self.animation_index = None;
     self.animation_time = 0.0;
@@ -1459,6 +1463,8 @@ impl Viewer {
     // being prepared.
     self.motion_line_config = None;
     self.clear_motion_lines();
+    self.motion_lines_visible = true;
+    self.seed_points_visible = false;
     self.clear_animated_gpu_state();
     self.camera_follow = None;
     self.camera_target_path = None;
@@ -1647,6 +1653,11 @@ impl Viewer {
     self.seed_points_visible = visible;
   }
 
+  /// Controls drawing without discarding the selected seeds or trajectories.
+  pub fn set_motion_lines_visible(&mut self, visible: bool) {
+    self.motion_lines_visible = visible;
+  }
+
   /// Prints process RSS and the exact sizes of buffers owned by this viewer.
   ///
   /// wgpu deliberately does not expose portable live VRAM counters. The GPU
@@ -1771,6 +1782,7 @@ impl Viewer {
     }
     Ok(())
   }
+
 
   /// Traces every animated vertex at the low rate requested by spacetime
   /// seeding and selects the max-min seed set on the GPU. Only the resulting
@@ -3001,17 +3013,19 @@ impl Viewer {
           occlusion_query_set:      None,
           timestamp_writes:         None,
         });
-        pass.set_pipeline(match self.motion_line_style {
-          MotionLineRenderStyle::Teaser => &self.motion_line_pipeline,
-          MotionLineRenderStyle::Dashed => &self.motion_line_dashed_pipeline,
-        });
         pass.set_bind_group(0, &self.bind, &[]);
-        pass.set_bind_group(1, &lines.line_bind, &[]);
-        // Two vertices per trajectory sample form one continuous strip per
-        // instance. Invalid fixed-capacity tail samples duplicate the last
-        // real sample and are discarded by the fragment stage.
-        let strip_vertices = lines.output_stride.saturating_mul(2);
-        pass.draw(0..strip_vertices, 0..lines.seed_count);
+        if self.motion_lines_visible {
+          pass.set_pipeline(match self.motion_line_style {
+            MotionLineRenderStyle::Teaser => &self.motion_line_pipeline,
+            MotionLineRenderStyle::Dashed => &self.motion_line_dashed_pipeline,
+          });
+          pass.set_bind_group(1, &lines.line_bind, &[]);
+          // Two vertices per trajectory sample form one continuous strip per
+          // instance. Invalid fixed-capacity tail samples duplicate the last
+          // real sample and are discarded by the fragment stage.
+          let strip_vertices = lines.output_stride.saturating_mul(2);
+          pass.draw(0..strip_vertices, 0..lines.seed_count);
+        }
         if self.seed_points_visible {
           if let Some(animated) = &self.animated {
             pass.set_pipeline(&self.seed_point_pipeline);
