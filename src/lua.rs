@@ -419,9 +419,10 @@ pub fn tasks(path: &str) -> Result<TaskQueue> {
       let selected_style = match name.as_str() {
         "teaser" => MotionLineRenderStyle::Teaser,
         "dashed" => MotionLineRenderStyle::Dashed,
+        "full-trajectory" => MotionLineRenderStyle::FullTrajectory,
         _ => {
           return Err(mlua::Error::external(
-            "unknown motion-line style; expected 'teaser' or 'dashed'",
+            "unknown motion-line style; expected 'teaser', 'dashed', or 'full-trajectory'",
           ));
         }
       };

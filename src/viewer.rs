@@ -58,6 +58,8 @@ pub enum MotionLineRenderStyle {
   Teaser,
   /// The arc-length dashed stroke adapted from `paper-compasso`.
   Dashed,
+  /// A continuous opaque dark gray stroke.
+  FullTrajectory,
 }
 
 /// GPU buffers for an animated scene.  Geometry and indices are immutable;
@@ -417,6 +419,7 @@ pub struct Viewer {
   pipeline: wgpu::RenderPipeline,
   animated_pipeline: wgpu::RenderPipeline,
   motion_line_pipeline: wgpu::RenderPipeline,
+  motion_line_full_trajectory_pipeline: wgpu::RenderPipeline,
   motion_line_dashed_pipeline: wgpu::RenderPipeline,
   seed_point_pipeline: wgpu::RenderPipeline,
   motion_composite_pipeline: wgpu::RenderPipeline,
@@ -962,18 +965,18 @@ impl Viewer {
         bind_group_layouts:   &[&layout, &motion_line_layout],
         push_constant_ranges: &[],
       });
-    let motion_line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-      label:         Some("motion-line render pipeline"),
+    let create_motion_line_pipeline = |label, vertex_entry, fragment_entry| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+      label:         Some(label),
       layout:        Some(&motion_line_pipeline_layout),
       vertex:        wgpu::VertexState {
         module:              &motion_line_shader,
-        entry_point:         Some("line_vertex"),
+        entry_point:         Some(vertex_entry),
         buffers:             &[],
         compilation_options: Default::default(),
       },
       fragment:      Some(wgpu::FragmentState {
         module:              &motion_line_shader,
-        entry_point:         Some("line_fragment"),
+        entry_point:         Some(fragment_entry),
         targets:             &[
           Some(wgpu::ColorTargetState {
             format:     wgpu::TextureFormat::Rgba16Float,
@@ -1030,6 +1033,12 @@ impl Viewer {
       multiview:     None,
       cache:         None,
     });
+    let motion_line_pipeline = create_motion_line_pipeline("motion-line render pipeline", "line_vertex", "line_fragment");
+    let motion_line_full_trajectory_pipeline = create_motion_line_pipeline(
+      "motion-line full trajectory render pipeline",
+      "full_trajectory_vertex",
+      "full_trajectory_fragment",
+    );
     let motion_line_dashed_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
       label:  Some("motion-line dashed render pipeline"),
       layout: Some(&motion_line_pipeline_layout),
@@ -1257,6 +1266,7 @@ impl Viewer {
       pipeline,
       animated_pipeline,
       motion_line_pipeline,
+      motion_line_full_trajectory_pipeline,
       motion_line_dashed_pipeline,
       seed_point_pipeline,
       motion_composite_pipeline,
@@ -2950,18 +2960,19 @@ impl Viewer {
         0.0
       };
       let model_diagonal = (self.mesh.max - self.mesh.min).length().max(1.0e-4);
-      let (tail_duration, strip_width, halo_depth, compasso_style) = match self.motion_line_style {
+      let (tail_duration, strip_width, halo_depth, style_flag) = match self.motion_line_style {
         MotionLineRenderStyle::Teaser => (0.75, 34.0, 0.01, 0.0),
         // Retain the Compasso width construction, but use a two-times longer
         // visible tail so the dash rhythm remains readable in the slides.
         MotionLineRenderStyle::Dashed => (1.6, 8.0, 0.0, 1.0),
+        MotionLineRenderStyle::FullTrajectory => (duration, model_diagonal * 0.012, 0.0, 2.0),
       };
       self.queue.write_buffer(
         &lines.style,
         0,
         bytemuck::bytes_of(&MotionLineStyle {
           timing:   [now, tail_duration, model_diagonal, 0.0],
-          widths:   [strip_width, halo_depth, compasso_style, 0.0],
+          widths:   [strip_width, halo_depth, style_flag, 0.0],
           viewport: [
             self.config.width as f32,
             self.config.height as f32,
@@ -3018,6 +3029,7 @@ impl Viewer {
           pass.set_pipeline(match self.motion_line_style {
             MotionLineRenderStyle::Teaser => &self.motion_line_pipeline,
             MotionLineRenderStyle::Dashed => &self.motion_line_dashed_pipeline,
+            MotionLineRenderStyle::FullTrajectory => &self.motion_line_full_trajectory_pipeline,
           });
           pass.set_bind_group(1, &lines.line_bind, &[]);
           // Two vertices per trajectory sample form one continuous strip per

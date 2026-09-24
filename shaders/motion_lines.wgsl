@@ -1,11 +1,9 @@
 // Rendering for the GPU-generated, adaptively sampled motion-line bundle.
 //
 // A trajectory is one continuous triangle strip: every sample contributes
-// exactly two vertices, one on each side of the projected trajectory. The
-// vertex shader uses the normalized average of neighboring projected
-// directions, as in the depth-halo method, so a bend does not become a
-// collection of disconnected quads. The stored surface normal is intentionally
-// not used here; it is reserved for a later 3D strip-construction stage.
+// exactly two vertices. Teaser and dashed strokes use a screen-space offset;
+// the full-trajectory stroke uses the sampled surface normal to form a 3D
+// ribbon in the surface tangent plane.
 
 struct MotionLineParams {
   seed_count:          u32,
@@ -29,8 +27,9 @@ struct MotionLineParams {
 struct MotionLineStyle {
   // now, visible tail duration, characteristic length, reserved
   timing:   vec4<f32>,
-  // complete screen-space strip width in pixels, maximum halo depth
-  // displacement, dashed-style flag (0 or 1), reserved
+  // strip width (pixels for teaser/dashed, world units for full trajectory),
+  // maximum halo depth displacement, style flag (0 teaser, 1 dashed,
+  // 2 full trajectory), reserved
   widths:   vec4<f32>,
   // physical viewport width and height in pixels
   viewport: vec4<f32>,
@@ -83,6 +82,31 @@ fn projected_position(sample: TrajectorySample) -> vec4<f32> {
 
 fn projected_xy(clip: vec4<f32>) -> vec2<f32> {
   return clip.xy / max(abs(clip.w), 1.0e-6);
+}
+
+fn ribbon_direction(normal_value: vec3<f32>, tangent_value: vec3<f32>) -> vec3<f32> {
+  var normal = normal_value;
+  if (dot(normal, normal) < 1.0e-8) {
+    normal = vec3<f32>(0.0, 1.0, 0.0);
+  } else {
+    normal = normalize(normal);
+  }
+
+  var side = vec3<f32>(0.0);
+  if (dot(tangent_value, tangent_value) > 1.0e-8) {
+    side = cross(normal, normalize(tangent_value));
+  }
+  if (dot(side, side) < 1.0e-8) {
+    // Motion parallel to the normal has no unique ribbon side. Choose a
+    // stable axis in the tangent plane without dividing by a near-zero cross.
+    let reference = select(
+      vec3<f32>(0.0, 1.0, 0.0),
+      vec3<f32>(1.0, 0.0, 0.0),
+      abs(normal.y) > 0.9,
+    );
+    side = cross(normal, reference);
+  }
+  return normalize(side);
 }
 
 // The active colormap from the teaser is retained rather than replaced by a
@@ -282,8 +306,6 @@ fn line_vertex(
   let previous_sample = line_trajectories[sample_index(seed_index, previous)];
   let current_sample = line_trajectories[sample_index(seed_index, sample)];
   let next_sample = line_trajectories[sample_index(seed_index, next)];
-  // Surface normals are intentionally not read. The only normal used here is
-  // the perspective screen-space perpendicular to the projected tangent.
   let previous_clip = projected_position(previous_sample);
   let current_clip = projected_position(current_sample);
   let next_clip = projected_position(next_sample);
@@ -380,6 +402,53 @@ fn line_vertex(
   return output;
 }
 
+@vertex
+fn full_trajectory_vertex(
+  @builtin(vertex_index) vertex_index: u32,
+  @builtin(instance_index) seed_index: u32,
+) -> LineOut {
+  var output: LineOut;
+  let count = max(line_counts[seed_index], 1u);
+  let last = count - 1u;
+  let requested_sample = vertex_index / 2u;
+  let sample = min(requested_sample, last);
+  var previous = sample;
+  var next = sample;
+  if (sample > 0u) {
+    previous = sample - 1u;
+  }
+  if (sample < last) {
+    next = sample + 1u;
+  }
+  let previous_sample = line_trajectories[sample_index(seed_index, previous)];
+  let current_sample = line_trajectories[sample_index(seed_index, sample)];
+  let next_sample = line_trajectories[sample_index(seed_index, next)];
+
+  var tangent = next_sample.position.xyz - previous_sample.position.xyz;
+  if (dot(tangent, tangent) < 1.0e-8) {
+    tangent = next_sample.position.xyz - current_sample.position.xyz;
+  }
+  if (dot(tangent, tangent) < 1.0e-8) {
+    tangent = current_sample.position.xyz - previous_sample.position.xyz;
+  }
+  if (dot(tangent, tangent) < 1.0e-8) {
+    tangent = current_sample.velocity.xyz;
+  }
+  let side = select(-1.0, 1.0, vertex_index % 2u == 1u);
+  let direction = ribbon_direction(current_sample.normal.xyz, tangent);
+  let ribbon_position = current_sample.position.xyz
+    + side * 0.5 * line_style.widths.x * direction;
+
+  output.position = uniforms.view_proj * vec4<f32>(ribbon_position, 1.0);
+  output.width_coordinate = side;
+  output.time = current_sample.metadata.x;
+  output.arc = 0.0;
+  output.speed = 0.0;
+  output.valid = f32(requested_sample < count);
+  output.cumulative_arc = current_sample.metadata.y;
+  return output;
+}
+
 @fragment
 fn line_fragment(input: LineOut) -> LineFragmentOut {
   if (input.valid < 0.5) {
@@ -430,6 +499,20 @@ fn line_fragment(input: LineOut) -> LineFragmentOut {
     depth += line_style.widths.y * v;
   }
   output.depth = clamp(depth, 0.0, 1.0);
+  return output;
+}
+
+// An opaque dark gray stroke for the complete extracted trajectory.
+@fragment
+fn full_trajectory_fragment(input: LineOut) -> LineFragmentOut {
+  if (input.valid < 0.5) {
+    discard;
+  }
+
+  var output: LineFragmentOut;
+  output.accumulation = vec4<f32>(0.08, 0.08, 0.08, 1.0);
+  output.revealage = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  output.depth = clamp(input.position.z, 0.0, 1.0);
   return output;
 }
 
