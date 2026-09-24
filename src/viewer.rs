@@ -20,9 +20,9 @@ use winit::platform::web::WindowExtWebSys;
 use winit::window::Window;
 
 /// Maximum number of Catmull–Rom subdivisions available for one uniform
-/// segment. The post-process pass starts at one and doubles this only when
-/// its flatness test says that the segment needs more samples.
-const MAX_MOTION_LINE_SUBDIVISIONS: u32 = 8;
+/// segment. The post-process pass begins with up to eight steps and doubles
+/// that count when its flatness test calls for more samples.
+const MAX_MOTION_LINE_SUBDIVISIONS: u32 = 16;
 /// Hard cap for the persistent adaptively sampled output. The cap is applied
 /// before allocation by reducing the largest per-segment subdivision level.
 const MAX_MOTION_LINE_POSTPROCESS_BYTES: u64 = 64 * 1024 * 1024;
@@ -2256,8 +2256,8 @@ impl Viewer {
       )
     }
     // Pick the largest power-of-two subdivision level that fits the output
-    // budget. This preserves the adaptive algorithm while preventing the
-    // previous fixed eight-way capacity from dominating long clips.
+    // budget. The shader always resamples each interval at least twice, so
+    // fail explicitly if the memory budget cannot hold a finer curve.
     let segment_count = (samples.sample_count as u64).saturating_sub(1);
     let max_steps_per_segment = if segment_count == 0 {
       1
@@ -2270,6 +2270,11 @@ impl Viewer {
     {
       max_subdivisions *= 2;
     }
+    if samples.sample_count > 1 && max_subdivisions < 2 {
+      bail!(
+        "motion-line post-processing needs at least two spline steps per sampled interval; lower the seed count or FPS"
+      )
+    }
     let output_stride = (samples.sample_count as u64)
       .saturating_sub(1)
       .checked_mul(max_subdivisions as u64)
@@ -2277,10 +2282,9 @@ impl Viewer {
       .and_then(|count| u32::try_from(count).ok())
       .ok_or_else(|| anyhow!("motion-line post-process output size overflow"))?;
     let model_diagonal = (self.mesh.max - self.mesh.min).length();
-    // This is intentionally a small, model-relative geometric tolerance. It
-    // keeps straight/slow portions at their original sample density while
-    // allowing visibly curved motion to receive extra Catmull–Rom samples.
-    let tolerance = (model_diagonal * 0.002).max(1.0e-5);
+    // Compare the spline against its chords at a scale smaller than the
+    // visible ribbon width, so bends receive extra samples where needed.
+    let tolerance = (model_diagonal * 0.0005).max(1.0e-5);
     let params = MotionLineParams {
       seed_count,
       sample_count: samples.sample_count,

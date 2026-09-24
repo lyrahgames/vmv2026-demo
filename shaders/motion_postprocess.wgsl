@@ -2,9 +2,9 @@
 //
 // One invocation owns one seed and writes a compact prefix of the fixed
 // output stride. It tests each Catmull–Rom segment against its straight chord;
-// only segments whose deviation exceeds the geometric tolerance receive
-// additional dyadic samples. Counts make the compact prefix available to the
-// render and future filtering/styling passes.
+// every segment receives finer spline samples, and curved segments receive
+// further dyadic subdivisions. Counts make the compact prefix available to
+// the render and future filtering/styling passes.
 
 struct MotionLineParams {
   seed_count:          u32,
@@ -120,10 +120,12 @@ fn segment_steps(
   p3: vec3<f32>,
 ) -> u32 {
   let deviation = segment_deviation(p0, p1, p2, p3);
-  var steps = 1u;
+  // A chord may fall within the geometric tolerance while its two joins
+  // still look angular, especially under a wide ribbon. Always sample the
+  // Catmull-Rom curve more finely than the original animation FPS.
+  var steps = min(params.max_subdivisions, 8u);
   // The chord error shrinks quadratically for this dyadic subdivision scheme.
-  // The repeated test avoids adding samples to already sufficiently straight
-  // trajectory segments.
+  // The flatness test adds a second level only for the sharpest bends.
   loop {
     if (steps >= params.max_subdivisions ||
         deviation / f32(steps * steps) <= params.tolerance) {

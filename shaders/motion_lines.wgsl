@@ -424,15 +424,18 @@ fn full_trajectory_vertex(
   let current_sample = line_trajectories[sample_index(seed_index, sample)];
   let next_sample = line_trajectories[sample_index(seed_index, next)];
 
-  var tangent = next_sample.position.xyz - previous_sample.position.xyz;
+  // The post-process stores the Catmull-Rom derivative at this exact sample.
+  // Neighboring polyline differences are biased when adjacent segments use
+  // different subdivision counts and make a wide ribbon look faceted.
+  var tangent = current_sample.velocity.xyz;
+  if (dot(tangent, tangent) < 1.0e-8) {
+    tangent = next_sample.position.xyz - previous_sample.position.xyz;
+  }
   if (dot(tangent, tangent) < 1.0e-8) {
     tangent = next_sample.position.xyz - current_sample.position.xyz;
   }
   if (dot(tangent, tangent) < 1.0e-8) {
     tangent = current_sample.position.xyz - previous_sample.position.xyz;
-  }
-  if (dot(tangent, tangent) < 1.0e-8) {
-    tangent = current_sample.velocity.xyz;
   }
   let side = select(-1.0, 1.0, vertex_index % 2u == 1u);
   let direction = ribbon_direction(current_sample.normal.xyz, tangent);
