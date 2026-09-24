@@ -420,9 +420,11 @@ pub fn tasks(path: &str) -> Result<TaskQueue> {
         "teaser" => MotionLineRenderStyle::Teaser,
         "dashed" => MotionLineRenderStyle::Dashed,
         "full-trajectory" => MotionLineRenderStyle::FullTrajectory,
+        "full-trajectory-window" => MotionLineRenderStyle::WindowedFullTrajectory,
+        "teaser-unweighted" => MotionLineRenderStyle::UnweightedTeaser,
         _ => {
           return Err(mlua::Error::external(
-            "unknown motion-line style; expected 'teaser', 'dashed', or 'full-trajectory'",
+            "unknown motion-line style; expected 'teaser', 'dashed', 'full-trajectory', 'full-trajectory-window', or 'teaser-unweighted'",
           ));
         }
       };

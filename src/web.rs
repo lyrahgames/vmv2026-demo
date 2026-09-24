@@ -419,7 +419,9 @@ impl ViewerHandle {
       "teaser" => MotionLineRenderStyle::Teaser,
       "dashed" => MotionLineRenderStyle::Dashed,
       "full-trajectory" => MotionLineRenderStyle::FullTrajectory,
-      _ => return Err(JsValue::from_str("unknown motion-line style; expected 'teaser', 'dashed', or 'full-trajectory'")),
+      "full-trajectory-window" => MotionLineRenderStyle::WindowedFullTrajectory,
+      "teaser-unweighted" => MotionLineRenderStyle::UnweightedTeaser,
+      _ => return Err(JsValue::from_str("unknown motion-line style; expected 'teaser', 'dashed', 'full-trajectory', 'full-trajectory-window', or 'teaser-unweighted'")),
     };
     let Some(queue) = self.queue() else {
       return Err(JsValue::from_str("viewer runtime has stopped"));

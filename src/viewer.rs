@@ -60,6 +60,10 @@ pub enum MotionLineRenderStyle {
   Dashed,
   /// A continuous opaque dark gray stroke.
   FullTrajectory,
+  /// The same ribbon clipped to the current time window.
+  WindowedFullTrajectory,
+  /// The teaser colormap and time window on an opaque stroke.
+  UnweightedTeaser,
 }
 
 /// GPU buffers for an animated scene.  Geometry and indices are immutable;
@@ -420,6 +424,8 @@ pub struct Viewer {
   animated_pipeline: wgpu::RenderPipeline,
   motion_line_pipeline: wgpu::RenderPipeline,
   motion_line_full_trajectory_pipeline: wgpu::RenderPipeline,
+  motion_line_windowed_full_trajectory_pipeline: wgpu::RenderPipeline,
+  motion_line_unweighted_pipeline: wgpu::RenderPipeline,
   motion_line_dashed_pipeline: wgpu::RenderPipeline,
   seed_point_pipeline: wgpu::RenderPipeline,
   motion_composite_pipeline: wgpu::RenderPipeline,
@@ -1039,6 +1045,16 @@ impl Viewer {
       "full_trajectory_vertex",
       "full_trajectory_fragment",
     );
+    let motion_line_windowed_full_trajectory_pipeline = create_motion_line_pipeline(
+      "motion-line windowed full trajectory render pipeline",
+      "full_trajectory_vertex",
+      "windowed_full_trajectory_fragment",
+    );
+    let motion_line_unweighted_pipeline = create_motion_line_pipeline(
+      "motion-line unweighted teaser render pipeline",
+      "line_vertex",
+      "unweighted_line_fragment",
+    );
     let motion_line_dashed_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
       label:  Some("motion-line dashed render pipeline"),
       layout: Some(&motion_line_pipeline_layout),
@@ -1267,6 +1283,8 @@ impl Viewer {
       animated_pipeline,
       motion_line_pipeline,
       motion_line_full_trajectory_pipeline,
+      motion_line_windowed_full_trajectory_pipeline,
+      motion_line_unweighted_pipeline,
       motion_line_dashed_pipeline,
       seed_point_pipeline,
       motion_composite_pipeline,
@@ -2970,6 +2988,9 @@ impl Viewer {
         // visible tail so the dash rhythm remains readable in the slides.
         MotionLineRenderStyle::Dashed => (1.6, 8.0, 0.0, 1.0),
         MotionLineRenderStyle::FullTrajectory => (duration, model_diagonal * 0.012, 0.0, 2.0),
+        MotionLineRenderStyle::WindowedFullTrajectory =>
+          (0.75, model_diagonal * 0.012, 0.0, 2.0),
+        MotionLineRenderStyle::UnweightedTeaser => (0.75, 17.0, 0.0, 3.0),
       };
       self.queue.write_buffer(
         &lines.style,
@@ -3034,6 +3055,9 @@ impl Viewer {
             MotionLineRenderStyle::Teaser => &self.motion_line_pipeline,
             MotionLineRenderStyle::Dashed => &self.motion_line_dashed_pipeline,
             MotionLineRenderStyle::FullTrajectory => &self.motion_line_full_trajectory_pipeline,
+            MotionLineRenderStyle::WindowedFullTrajectory =>
+              &self.motion_line_windowed_full_trajectory_pipeline,
+            MotionLineRenderStyle::UnweightedTeaser => &self.motion_line_unweighted_pipeline,
           });
           pass.set_bind_group(1, &lines.line_bind, &[]);
           // Two vertices per trajectory sample form one continuous strip per

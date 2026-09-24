@@ -29,7 +29,7 @@ struct MotionLineStyle {
   timing:   vec4<f32>,
   // strip width (pixels for teaser/dashed, world units for full trajectory),
   // maximum halo depth displacement, style flag (0 teaser, 1 dashed,
-  // 2 full trajectory), reserved
+  // 2 full trajectory, 3 unweighted teaser), reserved
   widths:   vec4<f32>,
   // physical viewport width and height in pixels
   viewport: vec4<f32>,
@@ -376,12 +376,16 @@ fn line_vertex(
       / max(next_sample.metadata.x - previous_sample.metadata.x, 1.0e-6),
     0.0,
   );
-  let compasso_style = line_style.widths.z > 0.5;
-  let stroke_weight = select(
-    temporal_weight(current_sample.metadata.x, arc, speed),
-    compasso_geometry_weight(current_sample.metadata.x, arc),
-    compasso_style,
-  );
+  let compasso_style = line_style.widths.z > 0.5 && line_style.widths.z < 1.5;
+  let unweighted_style = line_style.widths.z > 2.5 && line_style.widths.z < 3.5;
+  var stroke_weight = 1.0;
+  if (!unweighted_style) {
+    stroke_weight = select(
+      temporal_weight(current_sample.metadata.x, arc, speed),
+      compasso_geometry_weight(current_sample.metadata.x, arc),
+      compasso_style,
+    );
+  }
   // Compasso emits an outer extent at +/-1.5 line widths and interpolates
   // its fragment coordinate across +/-3. The teaser keeps its existing
   // +/-0.5-width strip and +/-1 coordinate exactly.
@@ -505,18 +509,54 @@ fn line_fragment(input: LineOut) -> LineFragmentOut {
   return output;
 }
 
+// Keep the teaser colormap and time window, but draw one solid color across
+// the stroke without an outline, depth displacement, or partial opacity.
+@fragment
+fn unweighted_line_fragment(input: LineOut) -> LineFragmentOut {
+  if (input.valid < 0.5) {
+    discard;
+  }
+  let delta = max(line_style.timing.y, 1.0e-4);
+  let age = line_style.timing.x - input.time;
+  if (age < 0.0 || age > delta) {
+    discard;
+  }
+  let line_color = colormap(age / delta / 0.8 + 0.2);
+  var output: LineFragmentOut;
+  output.accumulation = vec4<f32>(line_color, 1.0);
+  output.revealage = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  output.depth = clamp(input.position.z, 0.0, 1.0);
+  return output;
+}
+
+fn full_trajectory_stroke(input: LineOut) -> LineFragmentOut {
+  var output: LineFragmentOut;
+  output.accumulation = vec4<f32>(0.08, 0.08, 0.08, 1.0);
+  output.revealage = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  output.depth = clamp(input.position.z, 0.0, 1.0);
+  return output;
+}
+
 // An opaque dark gray stroke for the complete extracted trajectory.
 @fragment
 fn full_trajectory_fragment(input: LineOut) -> LineFragmentOut {
   if (input.valid < 0.5) {
     discard;
   }
+  return full_trajectory_stroke(input);
+}
 
-  var output: LineFragmentOut;
-  output.accumulation = vec4<f32>(0.08, 0.08, 0.08, 1.0);
-  output.revealage = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-  output.depth = clamp(input.position.z, 0.0, 1.0);
-  return output;
+// The same 3D ribbon, limited to the current temporal window.
+@fragment
+fn windowed_full_trajectory_fragment(input: LineOut) -> LineFragmentOut {
+  if (input.valid < 0.5) {
+    discard;
+  }
+  let age = line_style.timing.x - input.time;
+  if (age < 0.0 || age > line_style.timing.y) {
+    discard;
+  }
+  return full_trajectory_stroke(input);
 }
 
 @group(1) @binding(0) var oit_accumulation: texture_2d<f32>;
