@@ -157,14 +157,14 @@ struct TrajectorySample {
 /// The uniform trace and sampled pose streams are transient compute inputs,
 /// so only this final bundle remains resident for rendering.
 struct MotionLineGpuState {
-  // Only the final bundle survives extraction. Seeds, sampled palettes,
-  // morph weights, raw trajectories, and their compute bind groups are
-  // temporary and are explicitly destroyed after the submitted passes.
+  // The selected vertex IDs also drive the live seed-point render pass.
   trajectories:  wgpu::Buffer,
   counts:        wgpu::Buffer,
   params:        wgpu::Buffer,
   style:         wgpu::Buffer,
+  seeds:         wgpu::Buffer,
   line_bind:     wgpu::BindGroup,
+  seed_bind:     wgpu::BindGroup,
   seed_count:    u32,
   output_stride: u32,
 }
@@ -175,10 +175,15 @@ impl MotionLineGpuState {
     self.counts.destroy();
     self.params.destroy();
     self.style.destroy();
+    self.seeds.destroy();
   }
 
   fn gpu_buffer_bytes(&self) -> u64 {
-    self.trajectories.size() + self.counts.size() + self.params.size() + self.style.size()
+    self.trajectories.size()
+      + self.counts.size()
+      + self.params.size()
+      + self.style.size()
+      + self.seeds.size()
   }
 }
 
@@ -413,6 +418,7 @@ pub struct Viewer {
   animated_pipeline: wgpu::RenderPipeline,
   motion_line_pipeline: wgpu::RenderPipeline,
   motion_line_dashed_pipeline: wgpu::RenderPipeline,
+  seed_point_pipeline: wgpu::RenderPipeline,
   motion_composite_pipeline: wgpu::RenderPipeline,
   motion_trace_pipeline: wgpu::ComputePipeline,
   motion_post_pipeline: wgpu::ComputePipeline,
@@ -429,11 +435,13 @@ pub struct Viewer {
   motion_seed_trace_layout: wgpu::BindGroupLayout,
   motion_seed_selection_layout: wgpu::BindGroupLayout,
   motion_line_layout: wgpu::BindGroupLayout,
+  seed_point_layout: wgpu::BindGroupLayout,
   motion_composite_layout: wgpu::BindGroupLayout,
   motion_composite_bind: wgpu::BindGroup,
   animated: Option<AnimatedGpuState>,
   motion_line_config: Option<MotionLineConfig>,
   motion_line_style: MotionLineRenderStyle,
+  seed_points_visible: bool,
   motion_lines: Option<MotionLineGpuState>,
   last_motion_line_peak_bytes: u64,
   // MSAA color is resolved into the acquired surface texture. The depth
@@ -667,6 +675,10 @@ impl Viewer {
     let motion_line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
       label:  Some("motion-line render shader"),
       source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_lines.wgsl").into()),
+    });
+    let seed_point_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+      label: Some("seed-point ring shader"),
+      source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/seed_points.wgsl").into()),
     });
     // The dashed fragment is kept in its own WGSL file, but shares the
     // geometry, OIT declarations, and helpers embedded above.
@@ -1076,6 +1088,79 @@ impl Viewer {
       multiview:   None,
       cache:       None,
     });
+    let seed_point_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+      label: Some("seed-point layout"),
+      entries: &[
+        storage_layout_entry(0, wgpu::ShaderStages::VERTEX, true),
+        storage_layout_entry(1, wgpu::ShaderStages::VERTEX, true),
+        uniform_layout_entry(2, wgpu::ShaderStages::VERTEX),
+      ],
+    });
+    let seed_point_pipeline_layout =
+      device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("seed-point pipeline layout"),
+        bind_group_layouts: &[&layout, &skin_layout, &seed_point_layout],
+        push_constant_ranges: &[],
+      });
+    let seed_point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+      label: Some("seed-point ring pipeline"),
+      layout: Some(&seed_point_pipeline_layout),
+      vertex: wgpu::VertexState {
+        module: &seed_point_shader,
+        entry_point: Some("ring_vertex"),
+        buffers: &[],
+        compilation_options: Default::default(),
+      },
+      fragment: Some(wgpu::FragmentState {
+        module: &seed_point_shader,
+        entry_point: Some("ring_fragment"),
+        targets: &[
+          Some(wgpu::ColorTargetState {
+            format: wgpu::TextureFormat::Rgba16Float,
+            blend: Some(wgpu::BlendState {
+              color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+              },
+              alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+              },
+            }),
+            write_mask: wgpu::ColorWrites::ALL,
+          }),
+          Some(wgpu::ColorTargetState {
+            format: wgpu::TextureFormat::R8Unorm,
+            blend: Some(wgpu::BlendState {
+              color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+              },
+              alpha: wgpu::BlendComponent::REPLACE,
+            }),
+            write_mask: wgpu::ColorWrites::RED,
+          }),
+        ],
+        compilation_options: Default::default(),
+      }),
+      primitive: wgpu::PrimitiveState {
+        cull_mode: None,
+        ..Default::default()
+      },
+      depth_stencil: Some(wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth24Plus,
+        depth_write_enabled: false,
+        depth_compare: wgpu::CompareFunction::LessEqual,
+        stencil: Default::default(),
+        bias: Default::default(),
+      }),
+      multisample: multisample_state(sample_count),
+      multiview: None,
+      cache: None,
+    });
     let motion_composite_pipeline_layout =
       device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label:                Some("motion-line OIT composite pipeline layout"),
@@ -1172,6 +1257,7 @@ impl Viewer {
       animated_pipeline,
       motion_line_pipeline,
       motion_line_dashed_pipeline,
+      seed_point_pipeline,
       motion_composite_pipeline,
       motion_trace_pipeline,
       motion_post_pipeline,
@@ -1188,11 +1274,13 @@ impl Viewer {
       motion_seed_trace_layout,
       motion_seed_selection_layout,
       motion_line_layout,
+      seed_point_layout,
       motion_composite_layout,
       motion_composite_bind,
       animated: None,
       motion_line_config: None,
       motion_line_style: MotionLineRenderStyle::default(),
+      seed_points_visible: false,
       motion_lines: None,
       last_motion_line_peak_bytes: 0,
       sample_count,
@@ -1552,6 +1640,11 @@ impl Viewer {
   /// Changes only the rendering style of the current/future line bundle.
   pub fn set_motion_line_style(&mut self, style: MotionLineRenderStyle) {
     self.motion_line_style = style;
+  }
+
+  /// Shows the selected motion-line vertices as rings at their live pose.
+  pub fn set_seed_points_visible(&mut self, visible: bool) {
+    self.seed_points_visible = visible;
   }
 
   /// Prints process RSS and the exact sizes of buffers owned by this viewer.
@@ -2404,6 +2497,24 @@ impl Viewer {
         },
       ],
     });
+    let seed_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label: Some("seed-point render bind"),
+      layout: &self.seed_point_layout,
+      entries: &[
+        wgpu::BindGroupEntry {
+          binding: 0,
+          resource: animated.vertex.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding: 1,
+          resource: seeds_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+          binding: 2,
+          resource: style_buffer.as_entire_binding(),
+        },
+      ],
+    });
     let mut encoder = self
       .device
       .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2439,7 +2550,6 @@ impl Viewer {
     // remaining resident for the lifetime of the rendered line bundle.
     drop(trace_bind);
     drop(post_bind);
-    seeds_buffer.destroy();
     palettes_buffer.destroy();
     morph_weights_buffer.destroy();
     raw_trajectories_buffer.destroy();
@@ -2448,7 +2558,9 @@ impl Viewer {
       counts: counts_buffer,
       params: params_buffer,
       style: style_buffer,
+      seeds: seeds_buffer,
       line_bind,
+      seed_bind,
       seed_count: params.seed_count,
       output_stride: params.output_stride,
     };
@@ -2900,6 +3012,14 @@ impl Viewer {
         // real sample and are discarded by the fragment stage.
         let strip_vertices = lines.output_stride.saturating_mul(2);
         pass.draw(0..strip_vertices, 0..lines.seed_count);
+        if self.seed_points_visible {
+          if let Some(animated) = &self.animated {
+            pass.set_pipeline(&self.seed_point_pipeline);
+            pass.set_bind_group(1, &animated.bind, &[]);
+            pass.set_bind_group(2, &lines.seed_bind, &[]);
+            pass.draw(0..6, 0..lines.seed_count);
+          }
+        }
       }
 
       // Resolve the weighted average and revealage into the presentation

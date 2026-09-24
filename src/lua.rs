@@ -401,6 +401,18 @@ pub fn tasks(path: &str) -> Result<TaskQueue> {
     .set("clear_motion_lines", clear_motion_lines_function)
     .map_err(|e| anyhow!(e.to_string()))?;
 
+  let seed_points = queue.clone();
+  let set_seed_points_visible = lua
+    .create_function(move |_, visible: bool| {
+      seed_points.set_seed_points_visible(visible);
+      Ok(())
+    })
+    .map_err(|e| anyhow!(e.to_string()))?;
+  lua
+    .globals()
+    .set("set_seed_points_visible", set_seed_points_visible)
+    .map_err(|e| anyhow!(e.to_string()))?;
+
   let style_queue = queue.clone();
   let set_motion_line_style = lua
     .create_function(move |_, name: String| {

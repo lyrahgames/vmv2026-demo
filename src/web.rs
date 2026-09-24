@@ -396,6 +396,14 @@ impl ViewerHandle {
     }
   }
 
+  /// Shows the selected motion-line seeds as rings at their current pose.
+  #[wasm_bindgen(js_name = setSeedPointsVisible)]
+  pub fn set_seed_points_visible(&self, visible: bool) {
+    if let Some(queue) = self.queue() {
+      queue.set_web_seed_points_visible(self.id, visible);
+    }
+  }
+
   /// Selects a line style without rerunning the seed selection or trace.
   #[wasm_bindgen(js_name = setMotionLineStyle)]
   pub fn set_motion_line_style(&self, name: String) -> Result<(), JsValue> {
