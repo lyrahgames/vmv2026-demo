@@ -531,8 +531,9 @@ fn unweighted_line_fragment(input: LineOut) -> LineFragmentOut {
 
 fn full_trajectory_stroke(input: LineOut) -> LineFragmentOut {
   var output: LineFragmentOut;
-  output.accumulation = vec4<f32>(0.08, 0.08, 0.08, 1.0);
-  output.revealage = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  let alpha = clamp(line_style.widths.w, 0.0, 1.0);
+  output.accumulation = vec4<f32>(vec3<f32>(0.08) * alpha, alpha);
+  output.revealage = vec4<f32>(0.0, 0.0, 0.0, alpha);
   output.depth = clamp(input.position.z, 0.0, 1.0);
   return output;
 }

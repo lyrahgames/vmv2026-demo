@@ -262,6 +262,22 @@ impl ViewerHandle {
     }
   }
 
+  /// Renders an additional translucent copy of the selected animation at a
+  /// fixed time. Repeated calls accumulate multiple poses in the same canvas.
+  #[wasm_bindgen(js_name = renderPhantom)]
+  pub fn render_phantom(&self, time: f32, opacity: f32) {
+    if let Some(queue) = self.queue() {
+      queue.render_web_phantom(self.id, time, opacity);
+    }
+  }
+
+  #[wasm_bindgen(js_name = clearPhantoms)]
+  pub fn clear_phantoms(&self) {
+    if let Some(queue) = self.queue() {
+      queue.clear_web_phantoms(self.id);
+    }
+  }
+
   /// Sets the selected animation's playback multiplier.
   #[wasm_bindgen(js_name = setAnimationSpeed)]
   pub fn set_animation_speed(&self, speed: f32) {
@@ -428,6 +444,14 @@ impl ViewerHandle {
     };
     queue.set_web_motion_line_style(self.id, style);
     Ok(())
+  }
+
+  /// Sets per-viewer alpha for full-trajectory rendering styles.
+  #[wasm_bindgen(js_name = setMotionLineOpacity)]
+  pub fn set_motion_line_opacity(&self, opacity: f32) {
+    if let Some(queue) = self.queue() {
+      queue.set_web_motion_line_opacity(self.id, opacity);
+    }
   }
 
   pub fn set_camera(

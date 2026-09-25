@@ -476,6 +476,16 @@ impl TaskQueue {
   }
 
   #[cfg(target_arch = "wasm32")]
+  pub fn render_web_phantom(&self, id: u64, time: f32, opacity: f32) {
+    self.enqueue_web(id, move |viewer| viewer.render_phantom(time, opacity));
+  }
+
+  #[cfg(target_arch = "wasm32")]
+  pub fn clear_web_phantoms(&self, id: u64) {
+    self.enqueue_web(id, |viewer| viewer.clear_phantoms());
+  }
+
+  #[cfg(target_arch = "wasm32")]
   pub fn set_web_animation_speed(&self, id: u64, speed: f32) {
     self.enqueue_web(id, move |viewer| viewer.set_animation_speed(speed));
   }
@@ -510,6 +520,11 @@ impl TaskQueue {
   #[cfg(target_arch = "wasm32")]
   pub fn set_web_motion_line_style(&self, id: u64, style: MotionLineRenderStyle) {
     self.enqueue_web(id, move |viewer| viewer.set_motion_line_style(style));
+  }
+
+  #[cfg(target_arch = "wasm32")]
+  pub fn set_web_motion_line_opacity(&self, id: u64, opacity: f32) {
+    self.enqueue_web(id, move |viewer| viewer.set_motion_line_opacity(opacity));
   }
 }
 

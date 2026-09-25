@@ -83,6 +83,15 @@ struct AnimatedGpuState {
   count:             u32,
 }
 
+/// A translucent copy of the animated surface sampled at one fixed time.
+struct PhantomPose {
+  _palette:       wgpu::Buffer,
+  _morph_weights: wgpu::Buffer,
+  bind:           wgpu::BindGroup,
+  _opacity:       wgpu::Buffer,
+  opacity_bind:   wgpu::BindGroup,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct MotionLineParams {
@@ -422,6 +431,8 @@ pub struct Viewer {
   config: wgpu::SurfaceConfiguration,
   pipeline: wgpu::RenderPipeline,
   animated_pipeline: wgpu::RenderPipeline,
+  phantom_pipeline: wgpu::RenderPipeline,
+  phantom_opacity_layout: wgpu::BindGroupLayout,
   motion_line_pipeline: wgpu::RenderPipeline,
   motion_line_full_trajectory_pipeline: wgpu::RenderPipeline,
   motion_line_windowed_full_trajectory_pipeline: wgpu::RenderPipeline,
@@ -448,8 +459,10 @@ pub struct Viewer {
   motion_composite_layout: wgpu::BindGroupLayout,
   motion_composite_bind: wgpu::BindGroup,
   animated: Option<AnimatedGpuState>,
+  phantoms: Vec<PhantomPose>,
   motion_line_config: Option<MotionLineConfig>,
   motion_line_style: MotionLineRenderStyle,
+  motion_line_opacity: f32,
   motion_lines_visible: bool,
   seed_points_visible: bool,
   motion_lines: Option<MotionLineGpuState>,
@@ -664,6 +677,14 @@ impl Viewer {
       label:  Some("mesh shader"),
       source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mesh.wgsl").into()),
     });
+    let phantom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+      label: Some("translucent phantom mesh shader"),
+      source: wgpu::ShaderSource::Wgsl(concat!(
+        include_str!("../shaders/mesh.wgsl"),
+        "\n",
+        include_str!("../shaders/mesh_phantom.wgsl"),
+      ).into()),
+    });
     let motion_trace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
       label:  Some("motion-line trace shader"),
       source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_trace.wgsl").into()),
@@ -841,6 +862,55 @@ impl Viewer {
       multisample:   multisample_state(sample_count),
       multiview:     None,
       cache:         None,
+    });
+    let phantom_opacity_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+      label: Some("phantom opacity layout"),
+      entries: &[wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+          ty: wgpu::BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      }],
+    });
+    let phantom_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+      label: Some("translucent phantom pipeline layout"),
+      bind_group_layouts: &[&layout, &skin_layout, &phantom_opacity_layout],
+      push_constant_ranges: &[],
+    });
+    let phantom_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+      label: Some("translucent phantom mesh pipeline"),
+      layout: Some(&phantom_pipeline_layout),
+      vertex: wgpu::VertexState {
+        module: &phantom_shader,
+        entry_point: Some("vs_skinned"),
+        buffers: &[SkinnedVertex::layout()],
+        compilation_options: Default::default(),
+      },
+      fragment: Some(wgpu::FragmentState {
+        module: &phantom_shader,
+        entry_point: Some("fs_phantom"),
+        targets: &[Some(wgpu::ColorTargetState {
+          format,
+          blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+          write_mask: wgpu::ColorWrites::ALL,
+        })],
+        compilation_options: Default::default(),
+      }),
+      primitive: wgpu::PrimitiveState::default(),
+      depth_stencil: Some(wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth24Plus,
+        depth_write_enabled: false,
+        depth_compare: wgpu::CompareFunction::LessEqual,
+        stencil: Default::default(),
+        bias: Default::default(),
+      }),
+      multisample: multisample_state(sample_count),
+      multiview: None,
+      cache: None,
     });
     // Motion-line extraction has its own shader module and group-zero layout.
     // Keeping it separate from line rendering makes the required bind-group
@@ -1281,6 +1351,8 @@ impl Viewer {
       config,
       pipeline,
       animated_pipeline,
+      phantom_pipeline,
+      phantom_opacity_layout,
       motion_line_pipeline,
       motion_line_full_trajectory_pipeline,
       motion_line_windowed_full_trajectory_pipeline,
@@ -1307,8 +1379,10 @@ impl Viewer {
       motion_composite_layout,
       motion_composite_bind,
       animated: None,
+      phantoms: Vec::new(),
       motion_line_config: None,
       motion_line_style: MotionLineRenderStyle::default(),
+      motion_line_opacity: 1.0,
       motion_lines_visible: true,
       seed_points_visible: false,
       motion_lines: None,
@@ -1466,6 +1540,8 @@ impl Viewer {
     self.camera_target_path = None;
     self.scene = None;
     self.motion_line_config = None;
+    self.motion_line_opacity = 1.0;
+    self.phantoms.clear();
     self.clear_motion_lines();
     self.motion_lines_visible = true;
     self.seed_points_visible = false;
@@ -1490,6 +1566,8 @@ impl Viewer {
     // retaining two complete CPU scene graphs while the next GPU mesh is
     // being prepared.
     self.motion_line_config = None;
+    self.motion_line_opacity = 1.0;
+    self.phantoms.clear();
     self.clear_motion_lines();
     self.motion_lines_visible = true;
     self.seed_points_visible = false;
@@ -1674,6 +1752,11 @@ impl Viewer {
   /// Changes only the rendering style of the current/future line bundle.
   pub fn set_motion_line_style(&mut self, style: MotionLineRenderStyle) {
     self.motion_line_style = style;
+  }
+
+  /// Sets the opacity used by full-trajectory styles for this viewer only.
+  pub fn set_motion_line_opacity(&mut self, opacity: f32) {
+    self.motion_line_opacity = opacity.clamp(0.0, 1.0);
   }
 
   /// Shows the selected motion-line vertices as rings at their live pose.
@@ -2624,6 +2707,67 @@ impl Viewer {
     self.update_follow_camera();
   }
 
+  /// Adds a translucent GPU-skinned copy of the selected animation at `time`.
+  /// Each phantom owns its sampled palette while sharing the source geometry.
+  pub fn render_phantom(&mut self, time: f32, opacity: f32) {
+    let Some(index) = self.animation_index else { return };
+    let Some(scene) = self.scene.as_ref() else { return };
+    let Some(animated) = self.animated.as_ref() else { return };
+
+    let mut transforms = Vec::with_capacity(animated.transforms.len());
+    let mut morph_weights = Vec::with_capacity(animated.morph_weights_cpu.len());
+    scene.update_gpu_pose(Some(index), time, &mut transforms, &mut morph_weights);
+    let palette = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+      label: Some("phantom transform palette"),
+      contents: bytemuck::cast_slice(&transforms),
+      usage: wgpu::BufferUsages::STORAGE,
+    });
+    let zero_weight = [0.0_f32];
+    let weights = if morph_weights.is_empty() { &zero_weight[..] } else { &morph_weights };
+    let morph_weights_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+      label: Some("phantom morph weights"),
+      contents: bytemuck::cast_slice(weights),
+      usage: wgpu::BufferUsages::STORAGE,
+    });
+    let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label: Some("phantom skin pose bind"),
+      layout: &self.skin_layout,
+      entries: &[
+        wgpu::BindGroupEntry { binding: 0, resource: palette.as_entire_binding() },
+        wgpu::BindGroupEntry {
+          binding: 1,
+          resource: animated._morph_positions.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry { binding: 2, resource: morph_weights_buffer.as_entire_binding() },
+      ],
+    });
+    let opacity_data = [opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0];
+    let opacity_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+      label: Some("phantom opacity"),
+      contents: bytemuck::cast_slice(&opacity_data),
+      usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let opacity_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label: Some("phantom opacity bind"),
+      layout: &self.phantom_opacity_layout,
+      entries: &[wgpu::BindGroupEntry {
+        binding: 0,
+        resource: opacity_buffer.as_entire_binding(),
+      }],
+    });
+    self.phantoms.push(PhantomPose {
+      _palette: palette,
+      _morph_weights: morph_weights_buffer,
+      bind,
+      _opacity: opacity_buffer,
+      opacity_bind,
+    });
+  }
+
+  pub fn clear_phantoms(&mut self) {
+    self.phantoms.clear();
+  }
+
   /// Advances and uploads one animated frame. The vertex buffer is reused,
   /// so animation does not allocate GPU resources or reset the camera.
   pub fn update_animation(&mut self, delta_seconds: f32) {
@@ -2959,9 +3103,21 @@ impl Viewer {
           pass.draw_indexed(0..self.count, 0, 0..1);
         }
       }
+      if let Some(animated) = &self.animated {
+        if !self.phantoms.is_empty() {
+          pass.set_pipeline(&self.phantom_pipeline);
+          pass.set_vertex_buffer(0, animated.vertex.slice(..));
+          pass.set_index_buffer(animated.index.slice(..), wgpu::IndexFormat::Uint32);
+          for phantom in &self.phantoms {
+            pass.set_bind_group(1, &phantom.bind, &[]);
+            pass.set_bind_group(2, &phantom.opacity_bind, &[]);
+            pass.draw_indexed(0..animated.count, 0, 0..1);
+          }
+        }
+      }
     }
 
-    if self.scene_visible {
+    if self.scene_visible || (!self.phantoms.is_empty() && self.seed_points_visible) {
       if let Some(lines) = &self.motion_lines {
       // The extracted bundle is complete, but the teaser style displays a
       // moving temporal tail. Updating this tiny uniform is enough to animate
@@ -2997,7 +3153,7 @@ impl Viewer {
         0,
         bytemuck::bytes_of(&MotionLineStyle {
           timing:   [now, tail_duration, model_diagonal, 0.0],
-          widths:   [strip_width, halo_depth, style_flag, 0.0],
+          widths:   [strip_width, halo_depth, style_flag, self.motion_line_opacity],
           viewport: [
             self.config.width as f32,
             self.config.height as f32,
@@ -3066,10 +3222,18 @@ impl Viewer {
           let strip_vertices = lines.output_stride.saturating_mul(2);
           pass.draw(0..strip_vertices, 0..lines.seed_count);
         }
-        if self.seed_points_visible {
+        if self.seed_points_visible && self.scene_visible {
           if let Some(animated) = &self.animated {
             pass.set_pipeline(&self.seed_point_pipeline);
             pass.set_bind_group(1, &animated.bind, &[]);
+            pass.set_bind_group(2, &lines.seed_bind, &[]);
+            pass.draw(0..6, 0..lines.seed_count);
+          }
+        }
+        if self.seed_points_visible {
+          for phantom in &self.phantoms {
+            pass.set_pipeline(&self.seed_point_pipeline);
+            pass.set_bind_group(1, &phantom.bind, &[]);
             pass.set_bind_group(2, &lines.seed_bind, &[]);
             pass.draw(0..6, 0..lines.seed_count);
           }
